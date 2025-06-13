@@ -1,3 +1,5 @@
+# --- START OF FILE bios.py ---
+
 import struct
 import time
 import collections # For deque, a double-ended queue for keyboard buffer
@@ -110,6 +112,7 @@ class VGAEmulator:
         # Keyboard buffer for Pygame events (this is distinct from the emulated BIOS buffer)
         self.pygame_keyboard_buffer = collections.deque()
         self.waiting_for_key = False # Flag to indicate if we're waiting for a key (from uc.emu_stop)
+        self.keyboard_input_func_al = 0x00 # Store which AH=0Ah function is waiting, if any
 
         # Prepare a simple 8x8 font surface for drawing characters
         self.font_surfaces = {}
@@ -136,24 +139,11 @@ class VGAEmulator:
         print(f"    BIOS Keyboard Buffer initialized: Head={hex(KB_BUFFER_START_OFFSET)}, Tail={hex(KB_BUFFER_START_OFFSET)}")
 
     def _load_simple_font(self):
-        """Creates Pygame surfaces for a simple 8x8 font."""
-        # Using a simplified approach here. For a real font, you'd load a .FNT or generate from a TTF.
-        # This is enough to show basic text.
-        
+        """
+        Creates Pygame surfaces for a simple 8x8 font.
+        Crucially, it handles CP437 to Unicode mapping for better DOS text display.
+        """
         # A basic 8x8 font for ASCII 32-126
-        # ' ' (32), '!' (33), '"' (34), '#' (35), '$' (36), '%' (37), '&' (38), ''' (39)
-        # '(' (40), ')' (41), '*' (42), '+' (43), ',' (44), '-' (45), '.' (46), '/' (47)
-        # '0' (48) - '9' (57)
-        # ':' (58), ';' (59), '<' (60), '=' (61), '>' (62), '?' (63), '@' (64)
-        # 'A' (65) - 'Z' (90)
-        # '[' (91), '\' (92), ']' (93), '^' (94), '_' (95), '`' (96)
-        # 'a' (97) - 'z' (122)
-        # '{' (123), '|' (124), '}' (125), '~' (126)
-
-        # A very minimal font to demonstrate functionality.
-        # This isn't a proper CP437 font, but will handle common ASCII.
-        # For a true DOS experience, a proper font must be loaded.
-        # Example for 'A' and 'a':
         _font_data = {
             # space
             32: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -163,7 +153,6 @@ class VGAEmulator:
             65: [0x18, 0x24, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x00],
             # a
             97: [0x00, 0x00, 0x00, 0x38, 0x44, 0x44, 0x3C, 0x00],
-            # For other characters, we'll try to use Pygame's default font if available, or just blank.
             # Minimal digits for testing
             48: [0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00], # 0
             49: [0x08, 0x18, 0x08, 0x08, 0x08, 0x08, 0x3C, 0x00], # 1
@@ -175,42 +164,64 @@ class VGAEmulator:
             55: [0x7E, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x00], # 7
             56: [0x3C, 0x42, 0x42, 0x3C, 0x42, 0x42, 0x3C, 0x00], # 8
             57: [0x3C, 0x42, 0x42, 0x3E, 0x02, 0x04, 0x38, 0x00], # 9
+            # Minimal box-drawing characters for testing
+            0xC9: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], # ╔ - placeholder for now
+            0xBB: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], # ╗
+            0xC8: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], # ╚
+            0xBC: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], # ╝
+            0xCD: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], # ═
+            0xBA: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], # ║
         }
 
         # Pygame default font fallback for missing chars
         try:
-            pygame_font = pygame.font.Font(None, 8) # Smallest default font
-        except:
+            # Use a slightly larger font for better visibility, and let it scale down
+            pygame_font = pygame.font.Font(None, 16) # Increased size for better visibility
+            self.char_height = 16 # Adjust cell height to accommodate larger font
+            print(f"DEBUG: Using Pygame default font for fallback, size 16.")
+        except Exception as e:
             pygame_font = None # Fallback if font init fails
+            print(f"DEBUG: Failed to load Pygame font: {e}")
+            self.char_height = 8 # Revert to default if font fails
 
         for char_code in range(256):
             char_data = _font_data.get(char_code)
             if char_data:
-                # Create a surface for the character bitmap
-                char_surface = pygame.Surface((self.char_width, self.char_height), pygame.SRCALPHA)
+                # Create a surface for the hardcoded 8x8 character bitmap
+                char_surface = pygame.Surface((8, 8), pygame.SRCALPHA) # Always 8x8 for hardcoded
                 char_surface.fill((0,0,0,0)) # Transparent background
-                for y in range(self.char_height):
+                for y in range(8): # Iterate 8 rows for hardcoded font
                     row_pixels = char_data[y]
-                    for x in range(self.char_width):
+                    for x in range(8): # Iterate 8 columns
                         if (row_pixels >> (7 - x)) & 1: # Check bit
-                            # This will be drawn with the foreground color later.
-                            # For now, just mark it white on transparent background.
                             char_surface.set_at((x, y), (255, 255, 255, 255))
                 self.font_surfaces[char_code] = char_surface
             elif pygame_font:
                 try:
-                    # Render as if it's white text on black background, we will colorize it later.
-                    # This might not be pixel-perfect 8x8 but provides a visual fallback.
-                    text_surf = pygame_font.render(chr(char_code), False, (255, 255, 255))
-                    # Scale to 8x8 if needed, or just use as is if small enough.
+                    # For characters not in _font_data, use Pygame's font.
+                    # Convert CP437 char_code to Unicode for pygame.font.render
+                    # This is CRUCIAL for correctly displaying extended ASCII (e.g., box-drawing chars).
+                    unicode_char = bytes([char_code]).decode('cp437', errors='replace') # 'replace' for unknown glyphs
+                    
+                    text_surf = pygame_font.render(unicode_char, False, (255, 255, 255))
+                    
+                    # Scale or center the rendered text within the character cell
                     if text_surf.get_width() > self.char_width or text_surf.get_height() > self.char_height:
                          text_surf = pygame.transform.scale(text_surf, (self.char_width, self.char_height))
+                    else: # Center small characters in the cell
+                        centered_surf = pygame.Surface((self.char_width, self.char_height), pygame.SRCALPHA)
+                        x_offset = (self.char_width - text_surf.get_width()) // 2
+                        y_offset = (self.char_height - text_surf.get_height()) // 2
+                        centered_surf.blit(text_surf, (x_offset, y_offset))
+                        text_surf = centered_surf
+
                     self.font_surfaces[char_code] = text_surf
-                except Exception:
+                except Exception as e:
+                    print(f"DEBUG: Failed to render char {char_code} ({bytes([char_code]).decode('cp437', errors='replace')}) with Pygame font: {e}")
                     # Fallback for characters pygame.font can't render
                     self.font_surfaces[char_code] = pygame.Surface((self.char_width, self.char_height), pygame.SRCALPHA)
             else:
-                # Empty surface for unsupported characters
+                # Empty surface for unsupported characters without Pygame font
                 self.font_surfaces[char_code] = pygame.Surface((self.char_width, self.char_height), pygame.SRCALPHA)
 
     def set_mode(self, mode_id):
@@ -221,16 +232,17 @@ class VGAEmulator:
         self.current_mode = mode_id
         print(f"    Setting video mode: {hex(mode_id)}")
 
+        # Crucial: Use self.char_height for text mode dimensions
         if mode_id == 0x00: # 40x25 text mode
             self.display_width = 40 * self.char_width
-            self.display_height = 25 * self.char_height
+            self.display_height = 25 * self.char_height # Use self.char_height
             self.vram_base = VRAM_TEXT_COLOR_MODE
             self.is_text_mode = True
             self.chars_per_row = 40
             self.rows = 25
         elif mode_id == 0x03: # 80x25 text mode (common)
             self.display_width = 80 * self.char_width
-            self.display_height = 25 * self.char_height
+            self.display_height = 25 * self.char_height # Use self.char_height
             self.vram_base = VRAM_TEXT_COLOR_MODE
             self.is_text_mode = True
             self.chars_per_row = 80
@@ -244,7 +256,7 @@ class VGAEmulator:
             print(f"        Unsupported video mode: {hex(mode_id)}. Defaulting to 80x25 text.")
             self.current_mode = 0x03 # Fallback
             self.display_width = 80 * self.char_width
-            self.display_height = 25 * self.char_height
+            self.display_height = 25 * self.char_height # Use self.char_height
             self.vram_base = VRAM_TEXT_COLOR_MODE
             self.is_text_mode = True
             self.chars_per_row = 80
@@ -413,6 +425,10 @@ class VGAEmulator:
                 # For 80x25, it's 80 * 25 * 2 bytes = 4000 bytes.
                 vram_data = self.uc.mem_read(self.vram_base + (self.active_page * self.chars_per_row * self.rows * 2),
                                              self.chars_per_row * self.rows * 2)
+                # DEBUG: Print a small chunk of VRAM to see if data is there
+                # if vram_data[0] != 0x00 or vram_data[1] != 0x00: # Only print if first char is not blank
+                #     print(f"DEBUG: VRAM start ({hex(self.vram_base)}): Char {vram_data[0]:X}, Attr {vram_data[1]:X}")
+
             except UcError as e:
                 print(f"    Error reading VRAM for rendering: {e}. Skipping render.")
                 return
@@ -451,6 +467,8 @@ class VGAEmulator:
                                           self.char_width, 
                                           self.cursor_end_line - self.cursor_start_line + 1)
                 pygame.draw.rect(self.screen, VGA_PALETTE_16_COLORS[7], cursor_rect) # Light gray cursor
+                # DEBUG: Confirm cursor drawing
+                # print(f"DEBUG: Drawing cursor at ({self.cursor_col}, {self.cursor_row})")
 
         else: # Graphics mode rendering (e.g., 320x200, 256 colors)
             try:
@@ -472,6 +490,9 @@ class VGAEmulator:
                     self.screen.set_at((x, y), color_rgb)
         
         pygame.display.flip()
+        # DEBUG: Confirm screen flip
+        # print(f"DEBUG: Pygame screen flipped for mode {hex(self.current_mode)}")
+
 
     def process_input(self):
         """Processes Pygame events for keyboard input and window management."""
@@ -481,21 +502,41 @@ class VGAEmulator:
             elif event.type == pygame.KEYDOWN:
 
                 # Store ASCII and Scan Code for INT 16h and INT 21h
+                # Ensure ASCII value is from CP437, not system default encoding
                 ascii_val = event.unicode.encode('cp437', errors='ignore')[0] if event.unicode else 0
                 scan_code = event.scancode # Pygame scancodes often map well enough
                 
                 # Check for special keys if needed (e.g., Enter, Backspace)
                 if event.key == pygame.K_RETURN:
                     ascii_val = 0x0D # Carriage Return
+                    scan_code = 0x1C # Enter scan code
                 elif event.key == pygame.K_BACKSPACE:
                     ascii_val = 0x08 # Backspace
+                    scan_code = 0x0E # Backspace scan code
                 elif event.key == pygame.K_TAB:
                     ascii_val = 0x09 # Tab
+                    scan_code = 0x0F # Tab scan code
                 elif event.key == pygame.K_ESCAPE:
                     ascii_val = 0x1B # Escape
                     scan_code = 0x01 # Standard ESC scan code
+                elif event.key == pygame.K_UP:
+                    ascii_val = 0x00 # Extended key
+                    scan_code = 0x48 # Up arrow scan code
+                elif event.key == pygame.K_DOWN:
+                    ascii_val = 0x00 # Extended key
+                    scan_code = 0x50 # Down arrow scan code
+                elif event.key == pygame.K_LEFT:
+                    ascii_val = 0x00 # Extended key
+                    scan_code = 0x4B # Left arrow scan code
+                elif event.key == pygame.K_RIGHT:
+                    ascii_val = 0x00 # Extended key
+                    scan_code = 0x4D # Right arrow scan code
+                elif event.key == pygame.K_F1:
+                    ascii_val = 0x00
+                    scan_code = 0x3B # F1 scan code
+                # Add more special keys as needed for the game
 
-                print("storing ascii", ascii_val, scan_code)
+                print("storing ascii", hex(ascii_val), "scan_code", hex(scan_code))
 
                 # Add to internal Pygame keyboard buffer
                 self.pygame_keyboard_buffer.append((ascii_val, scan_code))
@@ -1001,17 +1042,16 @@ def handle_int21(uc, vga_emulator):
         # Read max buffer size (first byte)
         max_len = uc.mem_read(buffer_addr, 1)[0]
         
-        print(f"    Buffered input (AH=0Ah): Max {max_len} chars. Waiting...")
+        print(f"    Buffered input (AH=0Ah): Max {max_len} chars. Waiting for ENTER...")
         
         # This is a simplification. A real implementation would handle line editing (backspace, enter)
         # by iteratively processing keys from the BIOS buffer and writing them to the DOS buffer.
         # For now, we'll block and assume the next ENTER from Pygame finishes the line.
         
         vga_emulator.waiting_for_key = True # Indicate that we need input
-        # Store context for later processing if needed
-        uc.mem_write(BIOS_DATA_AREA + 0x40, struct.pack("<I", buffer_addr)) # Example: store buffer pointer in BDA for resume logic (hacky)
-        uc.mem_write(BIOS_DATA_AREA + 0x44, struct.pack("<B", max_len)) # Example: store max_len
-        uc.mem_write(BIOS_DATA_AREA + 0x45, struct.pack("<B", 0)) # current_len = 0
+        vga_emulator.keyboard_input_func_al = ah # Store the subfunction for resume logic
+        # Store buffer address for resume logic (hacky, ideally part of emulator state)
+        uc.mem_write(BIOS_DATA_AREA + 0x40, struct.pack("<I", buffer_addr)) 
         
         uc.emu_stop() # Stop and wait for user to press enter in pygame loop
 
