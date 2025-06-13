@@ -34,7 +34,6 @@ relevant snippets from ghidra:
      R::0000001f 31              ??         31h    1
 ```
 
-code1 block: lets verify this maps correctly on our script
 ```
 //
                              // CODE_1 
@@ -42,39 +41,6 @@ code1 block: lets verify this maps correctly on our script
                              //
              assume CS = 0x26f6
        26f6:0000 78              ??         78h    x
-```
-
-
-entry point: lets verify the fist bytes are correctly mapped
-```
-                             **************************************************************
-                             *                          FUNCTION                          *
-                             **************************************************************
-                             undefined __cdecl16far entry()
-                               assume CS = 0x26f6
-                               assume SP = 0x80
-                               assume SS = 0x4194
-             undefined         AL:1           <RETURN>
-                             entry                                                                                                  XREF[1]:     Entry Point(*)  
-       26f6:000e 06              PUSH       ES=>DAT_4000_19be                                = ??
-             assume SS = <UNKNOWN>
-             assume SP = <UNKNOWN>
-       2000:6f6f 0e              PUSH       CS=>DAT_4000_19bc                                = ??
-       2000:6f70 1f              POP        DS=>DAT_4000_19bc                                = ??
-       2000:6f71 8b 0e 0c 00     MOV        CX,word ptr [DAT_26f6_000c]                      = 0FD8h
-       2000:6f75 8b f1           MOV        SI,CX
-       2000:6f77 4e              DEC        SI
-       2000:6f78 89 f7           MOV        DI,SI
-       2000:6f7a 8c db           MOV        BX,DS
-       2000:6f7c 03 1e 0a 00     ADD        BX,word ptr [DAT_26f6_000a]                      = 19A0h
-       2000:6f80 8e c3           MOV        ES,BX
-       2000:6f82 fd              STD
-       2000:6f83 f3 a4           MOVSB.REP  ES:DI=>DAT_4000_1937,SI=>DAT_26f6_0fd7           = ??
-       2000:6f85 53              PUSH       BX=>DAT_4000_19bc                                = ??
-       2000:6f86 b8 2b 00        MOV        AX,0x2b
-       2000:6f89 50              PUSH       AX=>DAT_4000_19ba                                = ??
-       2000:6f8a cb              RETF                                                        = ??
-
 ```
 
 
@@ -579,34 +545,37 @@ this is the unpacker logic, our goal is to reach the last jmp, but we are gettin
 ```
 
 ```
-Executing 40A70: 01c7
-Executing 40A72: 8bc7
-Executing 40A74: 83e70f
-Executing 40A77: b104
-Executing 40A79: f36801c2
-Executing 40A7D: 8ec2
-Executing 40A7F: 26011d
-Executing 40A7F: 26011d
-Executing 40A82: ebe5
-Executing 40A69: ac
-Executing 40A6A: 08d0
-Executing 40A6C: b416
-Executing 40A6E: b400
-Executing 40A70: 1107
-Executing 40A72: 8bc7
-Executing 40A74: 83e70f
-Executing 40A77: b104
-Executing 40A79: f36801c2
-Executing 40A7D: 8ec2
-Executing 40A7F: 26011d
-Executing 40A7F: 26011d
-Executing 40A82: ebe5
-Executing 40A69: ac
-Executing 40A6A: 08d0
-Executing 40A6C: b416
-Executing 40A6E: b400
-Executing 40A70: 21478b
+Executing 40AB5: 2eff2f
+Executing 10378: 9a00008636
+Executing 36860: ba3e38
+Executing 36863: 8eda
+Executing 36865: 8c064284
+Executing 36869: 33ed
+Executing 3686B: 8bc4
+Executing 3686D: 051300
+Executing 36870: b104
+Executing 36872: d3e8
+Executing 36874: 8cd2
+Executing 36876: 03c2
+Executing 36878: a31a84
+Executing 3687B: a31c84
+Executing 3687E: 03061484
+Executing 36882: a31e84
+Executing 36885: a32884
+Executing 36888: a32c84
+Executing 3688B: 26a10200
+Executing 3688F: 2d0010
+Executing 36892: a33084
+Executing 36895: bf14bc
+Executing 36898: bedd01
+Executing 3689B: b91200
+Executing 3689E: 90
+Executing 3689F: fc
+Executing 368A0: 2eac
+Executing 368A2: b435
+Executing 368A4: cd21
 ```
 
+we are hitting the last jump of the packer and then quickly breaking at int 21 it seems, can we hook the jmp at 40AB5 and dump the full memory ?
+can we add int 21 handling and a vga display?
 
-it seems that the copy function starts overwriting itself, which is most likely unintended, what could be the causes?
