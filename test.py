@@ -55,67 +55,7 @@ def hook_code(uc, address, size, user_data):
     # The user_data['final_jmp_addr'] is pre-calculated to hit this exact instruction.
     if physical_address == user_data['final_jmp_addr'] and not UNPACKED_EXE_DUMPED:
         return 
-        print(f"[*] Reached final JMPF instruction at {hex(physical_address)}. Attempting to dump unpacked EXE.")
-        
-        # The LZEXE header (the *copied* one) is at the beginning of the current CS segment.
-        lzexe_header_base_phys = current_cs * 16
-        
-        # Read the "real" entry point and stack values from the LZEXE header in memory.
-        # These values have already been adjusted by the LZEXE relocation routine.
-        real_ip = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_IP_OFFSET, 2))[0]
-        real_cs = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_CS_OFFSET, 2))[0]
-        real_sp = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_SP_OFFSET, 2))[0]
-        real_ss = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_SS_OFFSET, 2))[0]
-
-        print(f"    Unpacked entry point (real CS:IP): {hex(real_cs)}:{hex(real_ip)}")
-        print(f"    Unpacked stack (real SS:SP): {hex(real_ss)}:{hex(real_sp)}")
-        
-        # The base of the decompressed program is (PSP_SEGMENT + 0x10) * 16.
-        # DS points to the PSP segment right before the final jump.
-        psp_segment = uc.reg_read(UC_X86_REG_DS) 
-        unpacked_program_base_phys = (psp_segment + 0x10) * 16
-        print(f"    Unpacked program base physical address: {hex(unpacked_program_base_phys)}")
-
-        # Read the MZ header of the unpacked program from memory
-        try:
-            unpacked_mz_header_in_mem = uc.mem_read(unpacked_program_base_phys, 0x40) # Read 64 bytes for header fields
-            p_e_magic = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_MAGIC_OFFSET:MZ_E_MAGIC_OFFSET+2])[0]
-            p_e_cblp = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_CBLP_OFFSET:MZ_E_CBLP_OFFSET+2])[0]
-            p_e_cp = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_CP_OFFSET:MZ_E_CP_OFFSET+2])[0]
-            p_e_cparhdr = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_CPARHDR_OFFSET:MZ_E_CPARHDR_OFFSET+2])[0]
-
-            if p_e_magic != 0x5A4D:
-                print(f"[!] Warning: MZ magic not found at unpacked base: {hex(p_e_magic)}")
-                # Fallback: estimate size based on stack address if MZ header is missing/corrupt
-                unpacked_size = real_ss * 16 - unpacked_program_base_phys 
-                print(f"    Estimated unpacked size (based on SS): {unpacked_size} bytes")
-            else:
-                # Calculate the total size of the unpacked executable image (header + code/data)
-                # This is the standard DOS formula for image size in bytes.
-                unpacked_size = (p_e_cp - 1) * 512 + p_e_cblp if p_e_cblp != 0 else p_e_cp * 512
-                print(f"    Unpacked MZ header found. e_cparhdr: {p_e_cparhdr}, e_cp: {p_e_cp}, e_cblp: {p_e_cblp}")
-                print(f"    Calculated unpacked EXE image size: {unpacked_size} bytes")
-
-            unpacked_size = 0x40000
-
-            # Dump the memory
-            if unpacked_size > 0:
-                extracted_data = uc.mem_read(unpacked_program_base_phys, unpacked_size)
-                output_filename = FILENAME.replace(".exe", "_unpacked.exe")
-                with open(output_filename, 'wb') as f:
-                    f.write(extracted_data)
-                print(f"[*] Successfully extracted unpacked EXE to '{output_filename}'")
-                UNPACKED_EXE_DUMPED = True # Set flag to prevent re-dumping
-            else:
-                print("[!] Unpacked size calculated as 0 or negative. Not dumping.")
-        except UcError as e:
-            print(f"[!] Error reading unpacked MZ header or data from memory: {e}")
-        except Exception as e:
-            print(f"[!] An unexpected error occurred during dump: {e}")
-
-        # Stop emulation after dumping
-        uc.emu_stop()
-
+ 
 
 def hook_mem_unmapped(uc, access, address, size, value, user_data):
     """
