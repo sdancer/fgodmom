@@ -27,34 +27,6 @@ VRAM_TEXT_COLOR_MODE = 0xB8000 # For text modes like 0x03
 VRAM_GRAPHICS_MODE = 0xA0000 # For graphics modes like 0x13
 VGA_MEM_SIZE = 0x20000 # 128KB, covers A0000-BFFFF
 
-# --- VGA/Text Mode Font Data ---
-# A very basic 8x8 font. In a real emulator, this would come from BIOS ROM.
-# This is a placeholder for standard ASCII characters 0-127.
-# Each character is 8 bytes (8 rows), each bit representing a pixel.
-# Source: Public domain character definitions or simple creation.
-BIOS_FONT_8X8 = [
-    # Char 0-15 (examples)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 00 NUL
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 01 SOH (blank for now)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 02 STX
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 03 ETX
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 04 EOT
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 05 ENQ
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 06 ACK
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 07 BEL
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 08 BS
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 09 TAB
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 0A LF
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 0B VT
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 0C FF
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 0D CR
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 0E SO
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # 0F SI
-    # ... more characters ... (filled in for common ASCII range)
-    # Placeholder for more characters, extending up to 255.
-    # For a full implementation, you'd need the full CP437 font.
-]
-
 # For now, let's include a minimal printable ASCII set (32-126) for demonstration.
 # This part is tedious to type out, but critical for text mode.
 # I will use a simplified font generation for common characters if a full font isn't pasted.
@@ -638,7 +610,109 @@ class VGAEmulator:
         print("    BIOS Keyboard buffer flushed.")
 
 
-# --- Interrupt Handlers Refactored ---
+
+# Define some placeholder addresses and values for demonstration.
+# In a real emulator, these would point to actual loaded ROM/RAM data.
+FONT_ROM_SEG = 0xC000 # Common segment for video BIOS ROM
+FONT_8X14_OFF = 0x1F00 # Example offset for 8x14 font
+FONT_8X8_FIRST_OFF = 0x2000 # Example offset for 8x8 font, first 128 chars
+FONT_8X8_SECOND_OFF = 0x2100 # Example offset for 8x8 font, second 128 chars
+FONT_9X14_ALT_OFF = 0x2200 # Example offset for 9x14 alternate font
+FONT_8X16_OFF = 0x2300 # Example offset for 8x16 font
+FONT_9X16_ALT_OFF = 0x2400 # Example offset for 9x16 alternate font
+
+INT_1F_VECTOR_SEG = 0x0000 # Interrupt vector table is at 0000:xxxx
+INT_1F_VECTOR_OFF = 0x007C # Offset for Int 1F (0x1F * 4)
+INT_43_VECTOR_SEG = 0x0000
+INT_43_VECTOR_OFF = 0x010C # Offset for Int 43 (0x43 * 4)
+
+# Placeholder values for CX (character height) and DL (number of rows)
+# These vary by font and video mode, but we can use common ones for debug info.
+DEFAULT_CHAR_HEIGHT = 16 # Typical for text modes
+DEFAULT_NUM_ROWS = 25    # Typical for text modes
+
+def handle_int10_11_30(uc: Uc):
+    """
+    Handles INT 10h, AH=0x11, AL=0x30: Get Font Information.
+    Prints debug information about the font/vector requested and
+    simulates setting output registers with placeholder values.
+
+    Args:
+        uc (Uc): The Unicorn engine instance.
+    """
+    al = uc.reg_read(UC_X86_REG_AL)
+    bh = uc.reg_read(UC_X86_REG_BH)
+
+    print(f"\n--- INT 10h, AH=0x11, AL=0x{al:02X} (Get Font Information) ---")
+    print(f"  Attempting to get information for BH=0x{bh:02X}")
+
+    # Default values for output registers (will be overwritten by cases)
+    es_val = 0x0000
+    bp_val = 0x0000
+    cx_val = DEFAULT_CHAR_HEIGHT
+    dl_val = DEFAULT_NUM_ROWS
+
+    info_str = "" # String to describe what was requested
+
+    # Simulate the switch(reg_bh) from DOSBox C code
+    if bh == 0x00:
+        info_str = "Requesting interrupt 0x1F vector (Video Parameters Pointer)"
+        es_val = INT_1F_VECTOR_SEG
+        bp_val = INT_1F_VECTOR_OFF
+    elif bh == 0x01:
+        info_str = "Requesting interrupt 0x43 vector (User-defined Graphics Characters)"
+        es_val = INT_43_VECTOR_SEG
+        bp_val = INT_43_VECTOR_OFF
+    elif bh == 0x02:
+        info_str = "Requesting 8x14 font (VGA/EGA)"
+        es_val = FONT_ROM_SEG
+        bp_val = FONT_8X14_OFF
+        cx_val = 14 # 8x14 font height
+    elif bh == 0x03:
+        info_str = "Requesting 8x8 font (first 128 chars)"
+        es_val = FONT_ROM_SEG
+        bp_val = FONT_8X8_FIRST_OFF
+        cx_val = 8 # 8x8 font height
+    elif bh == 0x04:
+        info_str = "Requesting 8x8 font (second 128 chars)"
+        es_val = FONT_ROM_SEG
+        bp_val = FONT_8X8_SECOND_OFF
+        cx_val = 8 # 8x8 font height
+    elif bh == 0x05:
+        info_str = "Requesting Alpha Alternate 9x14 font"
+        es_val = FONT_ROM_SEG
+        bp_val = FONT_9X14_ALT_OFF
+        cx_val = 14 # 9x14 font height
+    elif bh == 0x06:
+        info_str = "Requesting 8x16 font (VGA/MCGA)"
+        es_val = FONT_ROM_SEG
+        bp_val = FONT_8X16_OFF
+        cx_val = 16 # 8x16 font height
+    elif bh == 0x07:
+        info_str = "Requesting Alpha Alternate 9x16 font (VGA)"
+        es_val = FONT_ROM_SEG
+        bp_val = FONT_9X16_ALT_OFF
+        cx_val = 16 # 9x16 font height
+    else:
+        info_str = f"Unsupported or unknown font/vector request (BH=0x{bh:02X})"
+        # For unknown requests, BIOS often leaves registers untouched or sets to 0
+        es_val = 0x0000
+        bp_val = 0x0000
+        cx_val = 0x0000
+        dl_val = 0x0000
+        print(f"  WARNING: {info_str}")
+
+    print(f"  Program attempted: {info_str}")
+    print(f"  Simulating BIOS response:")
+    print(f"    Setting ES:BP = 0x{es_val:04X}:0x{bp_val:04X} (pointer to data)")
+    print(f"    Setting CX    = 0x{cx_val:04X} ({cx_val} scan lines per char)")
+    print(f"    Setting DL    = 0x{dl_val:02X} ({dl_val} text rows on screen)")
+
+    # Write the values back to the Unicorn registers
+    uc.reg_write(UC_X86_REG_ES, es_val)
+    uc.reg_write(UC_X86_REG_BP, bp_val)
+    uc.reg_write(UC_X86_REG_CX, cx_val)
+    uc.reg_write(UC_X86_REG_DL, dl_val)
 
 def handle_int10(uc, vga_emulator):
     """Handles INT 10h (Video Services) calls."""
@@ -795,11 +869,9 @@ def handle_int10(uc, vga_emulator):
 
     elif ah == 0x11: # Character Generator Functions (Load Fonts)
         al = uc.reg_read(UC_X86_REG_AL)
-        print(f"    Character Generator Function AL={hex(al)}. Acknowledged, no specific action.")
-        # No specific return values needed. Clear CF to signal success.
-        eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-        eflags &= ~0x0001 # Clear Carry Flag (CF)
-        uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+        
+        if al == 0x30: # Load 8x8 font (double dot)
+            handle_int10_11_30(uc)
 
     elif ah == 0x12: # EGA/VGA - specific functions
         bl = uc.reg_read(UC_X86_REG_BL)
@@ -948,222 +1020,4 @@ def handle_int16(uc, vga_emulator):
     # No specific flags to set/clear by default for INT 16h after execution.
     # ZF for 01h is handled.
 
-def handle_int21(uc, vga_emulator):
-    """Handles INT 21h (DOS Services) calls."""
-    ah = uc.reg_read(UC_X86_REG_AH)
-    current_cs = uc.reg_read(UC_X86_REG_CS)
-    current_ip = uc.reg_read(UC_X86_REG_IP)
-    print(f"[*] INT 21h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
 
-    if ah == 0x01: # Read character from standard input, with echo
-        key_data = vga_emulator.pop_key_from_bios_buffer()
-        if key_data:
-            ascii_val, scan_code = key_data
-            uc.reg_write(UC_X86_REG_AL, ascii_val)
-            print(f"    Read char (with echo): '{chr(ascii_val)}'")
-            # Echo the character to screen
-            vga_emulator.write_char_teletype(ascii_val)
-        else:
-            # If no char, signal that the emulator should wait for a key
-            print(f"    Waiting for key (INT 21h AH=01h)...")
-            vga_emulator.waiting_for_key = True
-            uc.emu_stop() # Stop emulation until key is pressed
-
-    elif ah == 0x02: # Write character to standard output
-        dl = uc.reg_read(UC_X86_REG_DL)
-        vga_emulator.write_char_teletype(dl)
-        uc.reg_write(UC_X86_REG_AL, dl) # AL = DL on return
-        print(f"    Write char: '{chr(dl)}'")
-
-    elif ah == 0x05: # Output character to printer (dummy)
-        dl = uc.reg_read(UC_X86_REG_DL)
-        print(f"    Printer output (dummy): '{chr(dl)}'")
-        uc.reg_write(UC_X86_REG_AL, dl)
-
-    elif ah == 0x06: # Direct console input or output
-        dl = uc.reg_read(UC_X86_REG_DL)
-        if dl == 0xFF: # Input (non-blocking)
-            key_data = vga_emulator.pop_key_from_bios_buffer() # Use pop for non-blocking read
-            if key_data:
-                ascii_val, scan_code = key_data
-                uc.reg_write(UC_X86_REG_AL, ascii_val)
-                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-                eflags &= ~0x0040 # Clear ZF (Zero Flag)
-                uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-                print(f"    Direct input: '{chr(ascii_val)}'")
-            else:
-                uc.reg_write(UC_X86_REG_AL, 0x00) # No character
-                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-                eflags |= 0x0040 # Set ZF
-                uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-                print(f"    Direct input: No character available (ZF set).")
-        else: # Output
-            vga_emulator.write_char_teletype(dl)
-            uc.reg_write(UC_X86_REG_AL, dl)
-            print(f"    Direct output: '{chr(dl)}'")
-
-    elif ah == 0x07: # Character input without echo to AL (blocking)
-        key_data = vga_emulator.pop_key_from_bios_buffer()
-        if key_data:
-            ascii_val, scan_code = key_data
-            uc.reg_write(UC_X86_REG_AL, ascii_val)
-            print(f"    Read char (no echo): '{chr(ascii_val)}'")
-        else:
-            print(f"    Waiting for key (INT 21h AH=07h)...")
-            vga_emulator.waiting_for_key = True
-            uc.emu_stop() # Stop emulation until key is pressed
-
-    elif ah == 0x09: # Output string
-        dx = uc.reg_read(UC_X86_REG_DX)
-        ds = uc.reg_read(UC_X86_REG_DS)
-        try:
-            addr = ds * 16 + dx
-            s = b""
-            while True:
-                byte = uc.mem_read(addr, 1)
-                if byte[0] == 0x24: # '$' terminator
-                    break
-                s += byte
-                addr += 1
-            decoded_s = s.decode('cp437', errors='ignore') # Use CP437 for DOS
-            print(f"    Output string: '{decoded_s}'")
-            # Write char by char using teletype func
-            for char_code in s:
-                vga_emulator.write_char_teletype(char_code)
-        except UcError:
-            print(f"    Failed to read string from {hex(ds)}:{hex(dx)}. Stopping.")
-            uc.emu_stop()
-
-    elif ah == 0x0A: # Buffered keyboard input
-        dx = uc.reg_read(UC_X86_REG_DX)
-        ds = uc.reg_read(UC_X86_REG_DS)
-        buffer_addr = ds * 16 + dx
-        
-        # Read max buffer size (first byte)
-        max_len = uc.mem_read(buffer_addr, 1)[0]
-        
-        print(f"    Buffered input (AH=0Ah): Max {max_len} chars. Waiting for ENTER...")
-        
-        # This is a simplification. A real implementation would handle line editing (backspace, enter)
-        # by iteratively processing keys from the BIOS buffer and writing them to the DOS buffer.
-        # For now, we'll block and assume the next ENTER from Pygame finishes the line.
-        
-        vga_emulator.waiting_for_key = True # Indicate that we need input
-        vga_emulator.keyboard_input_func_al = ah # Store the subfunction for resume logic
-        # Store buffer address for resume logic (hacky, ideally part of emulator state)
-        uc.mem_write(BIOS_DATA_AREA + 0x40, struct.pack("<I", buffer_addr)) 
-        
-        uc.emu_stop() # Stop and wait for user to press enter in pygame loop
-
-    elif ah == 0x0B: # Get input status (non-blocking)
-        if not vga_emulator.is_bios_kb_buffer_empty():
-            uc.reg_write(UC_X86_REG_AL, 0xFF) # Character available
-            print(f"    Input status: Character available (AL=FFh).")
-        else:
-            uc.reg_write(UC_X86_REG_AL, 0x00) # No character
-            print(f"    Input status: No character (AL=00h).")
-
-    elif ah == 0x0C: # Flush keyboard buffer and read standard input
-        al_subfunc = uc.reg_read(UC_X86_REG_AL)
-        vga_emulator.flush_bios_keyboard_buffer()
-        print(f"    Flush buffer, then call input func {hex(al_subfunc)}")
-        # Dispatch to the specific input function if AL is valid
-        if al_subfunc in [0x01, 0x06, 0x07, 0x08, 0x0A]: # 0x08 is DOS 1.0 read char
-            # Simulate the dispatch by calling the handler directly.
-            # This is a slight re-entry but works for this context.
-            # Need to restore AH after the inner call, or just let it be.
-            original_ah = uc.reg_read(UC_X86_REG_AH)
-            uc.reg_write(UC_X86_REG_AH, al_subfunc)
-            handle_int21(uc, vga_emulator)
-            uc.reg_write(UC_X86_REG_AH, original_ah) # Restore original AH
-        else:
-            print(f"    Invalid subfunction for AH=0Ch: {hex(al_subfunc)}. Buffer flushed, no input.")
-
-    elif ah == 0x0E: # Select default drive
-        dl = uc.reg_read(UC_X86_REG_DL) # New default drive (0=A:, 1=B:, etc)
-        # Dummy implementation, just print
-        print(f"    Select default drive: {chr(ord('A') + dl)}")
-        # Return total number of valid drive letters (e.g., 26 for A-Z)
-        uc.reg_write(UC_X86_REG_AL, 0x1A) # Assuming 26 drives A-Z
-    
-    elif ah == 0x19: # Get current default drive
-        # Dummy implementation, return drive C: (2)
-        uc.reg_write(UC_X86_REG_AL, 0x02) # C:
-        print(f"    Get current default drive: {chr(ord('A') + 0x02)}")
-
-    elif ah == 0x25: # Set Interrupt Vector
-        al = uc.reg_read(UC_X86_REG_AL)
-        dx = uc.reg_read(UC_X86_REG_DX) # New offset
-        ds = uc.reg_read(UC_X86_REG_DS) # New segment
-        vector_addr = al * 4 
-        try:
-            uc.mem_write(vector_addr, struct.pack("<H", dx))
-            uc.mem_write(vector_addr + 2, struct.pack("<H", ds))
-            print(f"    Set Interrupt Vector {hex(al)}h: To {hex(ds)}:{hex(dx)}")
-        except UcError:
-            print(f"    Failed to write vector to 0:{hex(vector_addr)}. Stopping.")
-            uc.emu_stop()
-
-    elif ah == 0x2A: # Get system date
-        # Return dummy date (e.g., Jan 1, 2000, Saturday)
-        uc.reg_write(UC_X86_REG_CX, 2000) # Year
-        uc.reg_write(UC_X86_REG_DH, 1)    # Month (1=Jan)
-        uc.reg_write(UC_X86_REG_DL, 1)    # Day (1)
-        uc.reg_write(UC_X86_REG_AL, 6)    # Day of week (6=Sat)
-        print(f"    Get system date: 2000-01-01 (Sat)")
-
-    elif ah == 0x2C: # Get system time
-        # Return dummy time (e.g., 10:30:00.00)
-        uc.reg_write(UC_X86_REG_CH, 10) # Hour
-        uc.reg_write(UC_X86_REG_CL, 30) # Minute
-        uc.reg_write(UC_X86_REG_DH, 0)  # Second
-        uc.reg_write(UC_X86_REG_DL, 0)  # 1/100 seconds
-        print(f"    Get system time: 10:30:00.00")
-
-    elif ah == 0x35: # Get Interrupt Vector
-        al = uc.reg_read(UC_X86_REG_AL)
-        vector_addr = al * 4
-        try:
-            vector_offset = struct.unpack("<H", uc.mem_read(vector_addr, 2))[0]
-            vector_segment = struct.unpack("<H", uc.mem_read(vector_addr + 2, 2))[0]
-            print(f"    Get Interrupt Vector {hex(al)}h: Returns {hex(vector_segment)}:{hex(vector_offset)}")
-            uc.reg_write(UC_X86_REG_ES, vector_segment)
-            uc.reg_write(UC_X86_REG_BX, vector_offset)
-        except UcError:
-            print(f"    Failed to read vector from 0:{hex(vector_addr)}. Stopping.")
-            uc.emu_stop()
-            
-    elif ah == 0x39: # Make Directory (dummy)
-        ds = uc.reg_read(UC_X86_REG_DS)
-        dx = uc.reg_read(UC_X86_REG_DX)
-        path_addr = ds * 16 + dx
-        try:
-            path_bytes = uc.mem_read(path_addr, 256) # Read a generous buffer
-            path = path_bytes.split(b'\x00')[0].decode('cp437', errors='ignore')
-            print(f"    Make directory (dummy): '{path}' - Success")
-            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-            eflags &= ~0x0001 # Clear CF for success
-            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-        except UcError:
-            print(f"    Failed to read path for MKDIR from {hex(path_addr)}. Setting CF.")
-            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-            eflags |= 0x0001 # Set CF for error
-            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-            uc.reg_write(UC_X86_REG_AX, 0x0003) # Path not found (dummy error)
-
-    elif ah == 0x4C: # Terminate with return code
-        al = uc.reg_read(UC_X86_REG_AL)
-        print(f"    Terminate Program (return code {hex(al)}). Stopping emulation.")
-        uc.emu_stop()
-
-    elif ah == 0x44: # IOCTL (Input/Output Control)
-        al = uc.reg_read(UC_X86_REG_AL)
-        print(f"    IOCTL: AL={hex(al)}. Acknowledged, returning success.")
-        uc.reg_write(UC_X86_REG_AX, 0x0000) # Set AX to 0 for success
-        eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-        eflags &= ~0x0001 # Clear Carry Flag (CF)
-        uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-        
-    else:
-        print(f"    Unhandled INT 21h function: AH={hex(ah)}. Stopping emulation.")
-        uc.emu_stop()
