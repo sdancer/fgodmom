@@ -9,6 +9,17 @@ import pygame
 # --- BIOS/DOS Data Areas (common for emulators) ---
 BIOS_DATA_AREA = 0x400 # Segment 0x40, physical 0x400
 
+# Keyboard buffer constants (standard 16 entries * 2 bytes/entry = 32 bytes)
+KB_BUFFER_START_OFFSET = 0x6C # Offset within segment 0x40
+KB_BUFFER_END_OFFSET = KB_BUFFER_START_OFFSET + (16 * 2) # End + 1
+KB_BUFFER_HEAD_PTR = 0x1E # Offset for head pointer (word)
+KB_BUFFER_TAIL_PTR = 0x20 # Offset for tail pointer (word)
+KB_BUFFER_START_ADDR = BIOS_DATA_AREA + KB_BUFFER_START_OFFSET
+KB_BUFFER_END_ADDR = BIOS_DATA_AREA + KB_BUFFER_END_OFFSET
+KB_BUFFER_HEAD_ADDR = BIOS_DATA_AREA + KB_BUFFER_HEAD_PTR
+KB_BUFFER_TAIL_ADDR = BIOS_DATA_AREA + KB_BUFFER_TAIL_PTR
+
+
 # --- Global VGA Memory Addresses ---
 VRAM_TEXT_COLOR_MODE = 0xB8000 # For text modes like 0x03
 VRAM_GRAPHICS_MODE = 0xA0000 # For graphics modes like 0x13
@@ -96,10 +107,9 @@ class VGAEmulator:
         self.cursor_visible = True
         self.active_page = 0 # For text modes
 
-        # Keyboard buffer for INT 21h AH=01h/07h/06h
-        self.keyboard_buffer = collections.deque()
-        self.waiting_for_key = False # Flag to indicate if we're waiting for a key
-        self.keyboard_input_func_al = 0x00 # Store AL value for AH=0Ch
+        # Keyboard buffer for Pygame events (this is distinct from the emulated BIOS buffer)
+        self.pygame_keyboard_buffer = collections.deque()
+        self.waiting_for_key = False # Flag to indicate if we're waiting for a key (from uc.emu_stop)
 
         # Prepare a simple 8x8 font surface for drawing characters
         self.font_surfaces = {}
@@ -107,6 +117,23 @@ class VGAEmulator:
 
         # Initialize with a default mode (e.g., 80x25 text mode)
         self.set_mode(0x03)
+
+        # Initialize BIOS Keyboard Buffer pointers (must be done in Unicorn's memory)
+        # These are standard addresses in the BIOS Data Area (segment 0x40)
+        # 0x40:0x1A = Buffer start offset (word)
+        # 0x40:0x1C = Buffer end offset (word)
+        # 0x40:0x1E = Head pointer (next key to read) (word)
+        # 0x40:0x20 = Tail pointer (next key to write) (word)
+        
+        # Set buffer start and end addresses in BDA
+        self.uc.mem_write(BIOS_DATA_AREA + 0x1A, struct.pack("<H", KB_BUFFER_START_OFFSET))
+        self.uc.mem_write(BIOS_DATA_AREA + 0x1C, struct.pack("<H", KB_BUFFER_END_OFFSET)) # End + 1
+        
+        # Initialize head and tail pointers to the start of the buffer (empty)
+        self.uc.mem_write(KB_BUFFER_HEAD_ADDR, struct.pack("<H", KB_BUFFER_START_OFFSET))
+        self.uc.mem_write(KB_BUFFER_TAIL_ADDR, struct.pack("<H", KB_BUFFER_START_OFFSET))
+
+        print(f"    BIOS Keyboard Buffer initialized: Head={hex(KB_BUFFER_START_OFFSET)}, Tail={hex(KB_BUFFER_START_OFFSET)}")
 
     def _load_simple_font(self):
         """Creates Pygame surfaces for a simple 8x8 font."""
@@ -137,6 +164,17 @@ class VGAEmulator:
             # a
             97: [0x00, 0x00, 0x00, 0x38, 0x44, 0x44, 0x3C, 0x00],
             # For other characters, we'll try to use Pygame's default font if available, or just blank.
+            # Minimal digits for testing
+            48: [0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00], # 0
+            49: [0x08, 0x18, 0x08, 0x08, 0x08, 0x08, 0x3C, 0x00], # 1
+            50: [0x3C, 0x42, 0x02, 0x04, 0x08, 0x10, 0x7E, 0x00], # 2
+            51: [0x3C, 0x42, 0x02, 0x1C, 0x02, 0x42, 0x3C, 0x00], # 3
+            52: [0x0C, 0x14, 0x24, 0x44, 0x7E, 0x04, 0x04, 0x00], # 4
+            53: [0x7E, 0x40, 0x7C, 0x02, 0x02, 0x42, 0x3C, 0x00], # 5
+            54: [0x3C, 0x40, 0x7C, 0x44, 0x44, 0x44, 0x3C, 0x00], # 6
+            55: [0x7E, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x00], # 7
+            56: [0x3C, 0x42, 0x42, 0x3C, 0x42, 0x42, 0x3C, 0x00], # 8
+            57: [0x3C, 0x42, 0x42, 0x3E, 0x02, 0x04, 0x38, 0x00], # 9
         }
 
         # Pygame default font fallback for missing chars
@@ -162,12 +200,14 @@ class VGAEmulator:
             elif pygame_font:
                 try:
                     # Render as if it's white text on black background, we will colorize it later.
+                    # This might not be pixel-perfect 8x8 but provides a visual fallback.
                     text_surf = pygame_font.render(chr(char_code), False, (255, 255, 255))
                     # Scale to 8x8 if needed, or just use as is if small enough.
                     if text_surf.get_width() > self.char_width or text_surf.get_height() > self.char_height:
                          text_surf = pygame.transform.scale(text_surf, (self.char_width, self.char_height))
                     self.font_surfaces[char_code] = text_surf
                 except Exception:
+                    # Fallback for characters pygame.font can't render
                     self.font_surfaces[char_code] = pygame.Surface((self.char_width, self.char_height), pygame.SRCALPHA)
             else:
                 # Empty surface for unsupported characters
@@ -439,6 +479,7 @@ class VGAEmulator:
             if event.type == pygame.QUIT:
                 return False # Signal to quit emulation
             elif event.type == pygame.KEYDOWN:
+
                 # Store ASCII and Scan Code for INT 16h and INT 21h
                 ascii_val = event.unicode.encode('cp437', errors='ignore')[0] if event.unicode else 0
                 scan_code = event.scancode # Pygame scancodes often map well enough
@@ -450,23 +491,110 @@ class VGAEmulator:
                     ascii_val = 0x08 # Backspace
                 elif event.key == pygame.K_TAB:
                     ascii_val = 0x09 # Tab
+                elif event.key == pygame.K_ESCAPE:
+                    ascii_val = 0x1B # Escape
+                    scan_code = 0x01 # Standard ESC scan code
 
-                # Add to internal keyboard buffer for INT 16h / 21h
-                self.keyboard_buffer.append((ascii_val, scan_code))
+                print("storing ascii", ascii_val, scan_code)
+
+                # Add to internal Pygame keyboard buffer
+                self.pygame_keyboard_buffer.append((ascii_val, scan_code))
                 self.waiting_for_key = False # A key was pressed
 
         return True # Continue emulation
 
-    def get_buffered_key(self, remove=True):
-        """Retrieves a key from the buffer."""
-        if self.keyboard_buffer:
-            key_data = self.keyboard_buffer.popleft() if remove else self.keyboard_buffer[0]
-            return key_data # (ascii_val, scan_code)
-        return None # No key available
+    # --- BIOS Keyboard Buffer Management ---
+    def _read_bios_kb_ptr(self, offset):
+        """Reads a word (pointer) from the BIOS keyboard data area."""
+        try:
+            return struct.unpack("<H", self.uc.mem_read(BIOS_DATA_AREA + offset, 2))[0]
+        except UcError as e:
+            print(f"    Error reading BIOS KB pointer at {hex(BIOS_DATA_AREA + offset)}: {e}")
+            return 0 # Fallback
 
-    def flush_keyboard_buffer(self):
-        self.keyboard_buffer.clear()
-        print("    Keyboard buffer flushed.")
+    def _write_bios_kb_ptr(self, offset, value):
+        """Writes a word (pointer) to the BIOS keyboard data area."""
+        try:
+            self.uc.mem_write(BIOS_DATA_AREA + offset, struct.pack("<H", value))
+        except UcError as e:
+            print(f"    Error writing BIOS KB pointer at {hex(BIOS_DATA_AREA + offset)}: {e}")
+
+    def is_bios_kb_buffer_empty(self):
+        head = self._read_bios_kb_ptr(KB_BUFFER_HEAD_PTR)
+        tail = self._read_bios_kb_ptr(KB_BUFFER_TAIL_PTR)
+        return head == tail
+
+    def push_key_to_bios_buffer(self, ascii_val, scan_code):
+        """Pushes a key (ASCII+ScanCode) into the emulated BIOS keyboard buffer."""
+        head = self._read_bios_kb_ptr(KB_BUFFER_HEAD_PTR)
+        tail = self._read_bios_kb_ptr(KB_BUFFER_TAIL_PTR)
+        
+        # Calculate next tail position
+        next_tail = tail + 2
+        if next_tail >= KB_BUFFER_END_OFFSET: # Wrap around if beyond buffer end
+            next_tail = KB_BUFFER_START_OFFSET
+        
+        if next_tail == head: # Buffer is full
+            print(f"    BIOS Keyboard buffer full. Key {hex(ascii_val)} ignored.")
+            return False
+            
+        key_word = (ascii_val << 8) | scan_code
+        try:
+            self.uc.mem_write(BIOS_DATA_AREA + tail, struct.pack("<H", key_word))
+            self._write_bios_kb_ptr(KB_BUFFER_TAIL_PTR, next_tail)
+            print(f"    Pushed key to BIOS buffer: ASCII={hex(ascii_val)}, ScanCode={hex(scan_code)}")
+            return True
+        except UcError as e:
+            print(f"    Error writing key to BIOS KB buffer at {hex(BIOS_DATA_AREA + tail)}: {e}")
+            return False
+
+    def pop_key_from_bios_buffer(self):
+        """Pops a key from the emulated BIOS keyboard buffer."""
+        head = self._read_bios_kb_ptr(KB_BUFFER_HEAD_PTR)
+        tail = self._read_bios_kb_ptr(KB_BUFFER_TAIL_PTR)
+
+        if head == tail: # Buffer empty
+            return None # No key available
+        
+        try:
+            key_word = struct.unpack("<H", self.uc.mem_read(BIOS_DATA_AREA + head, 2))[0]
+            
+            next_head = head + 2
+            if next_head >= KB_BUFFER_END_OFFSET: # Wrap around
+                next_head = KB_BUFFER_START_OFFSET
+            
+            self._write_bios_kb_ptr(KB_BUFFER_HEAD_PTR, next_head)
+            
+            ascii_val = (key_word >> 8) & 0xFF
+            scan_code = key_word & 0xFF
+            print(f"    Popped key from BIOS buffer: ASCII={hex(ascii_val)}, ScanCode={hex(scan_code)}")
+            return ascii_val, scan_code
+        except UcError as e:
+            print(f"    Error reading key from BIOS KB buffer at {hex(BIOS_DATA_AREA + head)}: {e}")
+            return None
+
+    def peek_key_from_bios_buffer(self):
+        """Peeks at the next key in the emulated BIOS keyboard buffer without removing it."""
+        head = self._read_bios_kb_ptr(KB_BUFFER_HEAD_PTR)
+        tail = self._read_bios_kb_ptr(KB_BUFFER_TAIL_PTR)
+
+        if head == tail: # Buffer empty
+            return None # No key available
+        
+        try:
+            key_word = struct.unpack("<H", self.uc.mem_read(BIOS_DATA_AREA + head, 2))[0]
+            ascii_val = (key_word >> 8) & 0xFF
+            scan_code = key_word & 0xFF
+            return ascii_val, scan_code
+        except UcError as e:
+            print(f"    Error peeking key from BIOS KB buffer at {hex(BIOS_DATA_AREA + head)}: {e}")
+            return None
+
+    def flush_bios_keyboard_buffer(self):
+        """Flushes the emulated BIOS keyboard buffer."""
+        self._write_bios_kb_ptr(KB_BUFFER_HEAD_PTR, KB_BUFFER_START_OFFSET)
+        self._write_bios_kb_ptr(KB_BUFFER_TAIL_PTR, KB_BUFFER_START_OFFSET)
+        print("    BIOS Keyboard buffer flushed.")
 
 
 # --- Interrupt Handlers Refactored ---
@@ -710,14 +838,84 @@ def handle_int10(uc, vga_emulator):
     uc.reg_write(UC_X86_REG_EFLAGS, eflags)
 
 
+def handle_int16(uc, vga_emulator):
+    """Handles INT 16h (Keyboard Services) calls."""
+    ah = uc.reg_read(UC_X86_REG_AH)
+    current_cs = uc.reg_read(UC_X86_REG_CS)
+    current_ip = uc.reg_read(UC_X86_REG_IP)
+    print(f"[*] INT 16h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
+
+    if ah == 0x00: # Read Character from Keyboard
+        key_data = vga_emulator.pop_key_from_bios_buffer()
+        if key_data:
+            ascii_val, scan_code = key_data
+            uc.reg_write(UC_X86_REG_AL, ascii_val)
+            uc.reg_write(UC_X86_REG_AH, scan_code)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            eflags &= ~0x0040 # Clear ZF (Zero Flag) - key was read
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+        else:
+            # No key available, set waiting flag and stop emulation
+            print(f"    Waiting for key (INT 16h AH=00h)...")
+            vga_emulator.waiting_for_key = True
+            uc.emu_stop()
+    
+    elif ah == 0x01: # Check Keyboard Status
+        key_data = vga_emulator.peek_key_from_bios_buffer()
+        if key_data:
+            ascii_val, scan_code = key_data
+            uc.reg_write(UC_X86_REG_AL, ascii_val)
+            uc.reg_write(UC_X86_REG_AH, scan_code)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            eflags &= ~0x0040 # Clear ZF - key is available
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+            print(f"    Key available (INT 16h AH=01h): ASCII={hex(ascii_val)}, ScanCode={hex(scan_code)}")
+        else:
+            uc.reg_write(UC_X86_REG_AX, 0x0000) # AX = 0, no key
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            eflags |= 0x0040 # Set ZF - no key
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+            print(f"    No key available (INT 16h AH=01h).")
+
+    elif ah == 0x02: # Get Shift Status
+        # Shift status byte at 0x40:0x17 (physical 0x417)
+        # Bit 0: Right SHIFT, Bit 1: Left SHIFT, Bit 2: CTRL, Bit 3: ALT
+        # Bit 4: SCROLL LOCK, Bit 5: NUM LOCK, Bit 6: CAPS LOCK, Bit 7: INS
+        # We can simulate a basic status, or leave it at 0 for now.
+        # For a full emulator, you'd update this byte from Pygame modifier keys.
+        shift_status = uc.mem_read(BIOS_DATA_AREA + 0x17, 1)[0] # Read current status
+        uc.reg_write(UC_X86_REG_AL, shift_status)
+        print(f"    Get Shift Status (INT 16h AH=02h): AL={hex(shift_status)}")
+
+    elif ah == 0x05: # Keyboard Write (push key to buffer) - not usually called by programs
+        # This function is used by keyboard drivers (e.g., INT 09h handler) to push keys.
+        # AX = ASCII+ScanCode
+        key_word = uc.reg_read(UC_X86_REG_AX)
+        ascii_val = (key_word >> 8) & 0xFF
+        scan_code = key_word & 0xFF
+        success = vga_emulator.push_key_to_bios_buffer(ascii_val, scan_code)
+        if success:
+            uc.reg_write(UC_X86_REG_AL, 0x01) # Success
+        else:
+            uc.reg_write(UC_X86_REG_AL, 0x00) # Buffer full
+        print(f"    Keyboard Write (INT 16h AH=05h): AX={hex(key_word)}, Success={success}")
+
+    else:
+        print(f"    Unhandled INT 16h function: AH={hex(ah)}. Stopping emulation.")
+        uc.emu_stop()
+
+    # No specific flags to set/clear by default for INT 16h after execution.
+    # ZF for 01h is handled.
 
 def handle_int21(uc, vga_emulator):
     """Handles INT 21h (DOS Services) calls."""
     ah = uc.reg_read(UC_X86_REG_AH)
-    print(f"[*] INT 21h, AH={hex(ah)}")
+    current_cs = uc.reg_read(UC_X86_REG_CS)
+    current_ip = uc.reg_read(UC_X86_REG_IP)
+    print(f"[*] INT 21h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
 
     if ah == 0x01: # Read character from standard input, with echo
-        key_data = vga_emulator.get_buffered_key(remove=True)
+        key_data = vga_emulator.pop_key_from_bios_buffer()
         if key_data:
             ascii_val, scan_code = key_data
             uc.reg_write(UC_X86_REG_AL, ascii_val)
@@ -726,7 +924,7 @@ def handle_int21(uc, vga_emulator):
             vga_emulator.write_char_teletype(ascii_val)
         else:
             # If no char, signal that the emulator should wait for a key
-            print(f"    Waiting for key (AH=01h)...")
+            print(f"    Waiting for key (INT 21h AH=01h)...")
             vga_emulator.waiting_for_key = True
             uc.emu_stop() # Stop emulation until key is pressed
 
@@ -743,8 +941,8 @@ def handle_int21(uc, vga_emulator):
 
     elif ah == 0x06: # Direct console input or output
         dl = uc.reg_read(UC_X86_REG_DL)
-        if dl == 0xFF: # Input
-            key_data = vga_emulator.get_buffered_key(remove=True)
+        if dl == 0xFF: # Input (non-blocking)
+            key_data = vga_emulator.pop_key_from_bios_buffer() # Use pop for non-blocking read
             if key_data:
                 ascii_val, scan_code = key_data
                 uc.reg_write(UC_X86_REG_AL, ascii_val)
@@ -763,14 +961,14 @@ def handle_int21(uc, vga_emulator):
             uc.reg_write(UC_X86_REG_AL, dl)
             print(f"    Direct output: '{chr(dl)}'")
 
-    elif ah == 0x07: # Character input without echo to AL
-        key_data = vga_emulator.get_buffered_key(remove=True)
+    elif ah == 0x07: # Character input without echo to AL (blocking)
+        key_data = vga_emulator.pop_key_from_bios_buffer()
         if key_data:
             ascii_val, scan_code = key_data
             uc.reg_write(UC_X86_REG_AL, ascii_val)
             print(f"    Read char (no echo): '{chr(ascii_val)}'")
         else:
-            print(f"    Waiting for key (AH=07h)...")
+            print(f"    Waiting for key (INT 21h AH=07h)...")
             vga_emulator.waiting_for_key = True
             uc.emu_stop() # Stop emulation until key is pressed
 
@@ -805,26 +1003,20 @@ def handle_int21(uc, vga_emulator):
         
         print(f"    Buffered input (AH=0Ah): Max {max_len} chars. Waiting...")
         
-        input_buffer_physical_addr = buffer_addr + 2 # Actual buffer starts at byte 2
-        current_len = 0
-        input_string_bytes = []
-
+        # This is a simplification. A real implementation would handle line editing (backspace, enter)
+        # by iteratively processing keys from the BIOS buffer and writing them to the DOS buffer.
+        # For now, we'll block and assume the next ENTER from Pygame finishes the line.
+        
         vga_emulator.waiting_for_key = True # Indicate that we need input
-        vga_emulator.keyboard_input_func_al = 0x0A # Store which function requested input
-        # This will be handled in the main loop to resume emulation after input
-
-        # Note: This is an incomplete implementation for AH=0Ah, as it would need
-        # to handle backspace, enter, and other line editing features.
-        # For now, it just waits for a line and stores it.
-        # A full implementation would need to process keys one by one and update buffer.
-        print(f"    (AH=0Ah is complex to emulate synchronously with Pygame input. ")
-        print(f"     Returning dummy input for now, or will stop if waiting flag isn't cleared.)")
-        # For simplicity, let's just make it a blocking call and simulate input.
-        # In a real scenario, this would be a complex state machine.
+        # Store context for later processing if needed
+        uc.mem_write(BIOS_DATA_AREA + 0x40, struct.pack("<I", buffer_addr)) # Example: store buffer pointer in BDA for resume logic (hacky)
+        uc.mem_write(BIOS_DATA_AREA + 0x44, struct.pack("<B", max_len)) # Example: store max_len
+        uc.mem_write(BIOS_DATA_AREA + 0x45, struct.pack("<B", 0)) # current_len = 0
+        
         uc.emu_stop() # Stop and wait for user to press enter in pygame loop
 
-    elif ah == 0x0B: # Get input status
-        if vga_emulator.get_buffered_key(remove=False):
+    elif ah == 0x0B: # Get input status (non-blocking)
+        if not vga_emulator.is_bios_kb_buffer_empty():
             uc.reg_write(UC_X86_REG_AL, 0xFF) # Character available
             print(f"    Input status: Character available (AL=FFh).")
         else:
@@ -833,15 +1025,17 @@ def handle_int21(uc, vga_emulator):
 
     elif ah == 0x0C: # Flush keyboard buffer and read standard input
         al_subfunc = uc.reg_read(UC_X86_REG_AL)
-        vga_emulator.flush_keyboard_buffer()
+        vga_emulator.flush_bios_keyboard_buffer()
         print(f"    Flush buffer, then call input func {hex(al_subfunc)}")
         # Dispatch to the specific input function if AL is valid
-        if al_subfunc in [0x01, 0x06, 0x07, 0x08, 0x0A]:
-            # Temporarily set AH for the sub-function call.
-            # This is a bit hacky as we're re-entering the handler.
-            # A better way would be to call a dedicated function.
+        if al_subfunc in [0x01, 0x06, 0x07, 0x08, 0x0A]: # 0x08 is DOS 1.0 read char
+            # Simulate the dispatch by calling the handler directly.
+            # This is a slight re-entry but works for this context.
+            # Need to restore AH after the inner call, or just let it be.
+            original_ah = uc.reg_read(UC_X86_REG_AH)
             uc.reg_write(UC_X86_REG_AH, al_subfunc)
-            handle_int21(uc, vga_emulator) # Recursive call
+            handle_int21(uc, vga_emulator)
+            uc.reg_write(UC_X86_REG_AH, original_ah) # Restore original AH
         else:
             print(f"    Invalid subfunction for AH=0Ch: {hex(al_subfunc)}. Buffer flushed, no input.")
 
@@ -933,5 +1127,3 @@ def handle_int21(uc, vga_emulator):
     else:
         print(f"    Unhandled INT 21h function: AH={hex(ah)}. Stopping emulation.")
         uc.emu_stop()
-
-
