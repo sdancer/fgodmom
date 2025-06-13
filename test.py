@@ -6,16 +6,14 @@ from unicorn.x86_const import *
 FILENAME = "fgodmom.exe"
 
 # --- Global Variables for Unicorn State Tracking ---
-# Based on Ghidra's runtime analysis (CS=0x26F6, IP=0x000E) and original e_cs (0x16F6),
+# Based on Ghidra's analysis of fgodmom.exe (CS=0x26F6, e_cs=0x16F6),
 # the program is loaded at a base segment that results in the observed CS.
-# If Observed CS (0x26F6) - e_cs (0x16F6) = 0x1000, then the load base segment is 0x1000.
+# Load base segment = Observed CS - e_cs = 0x26F6 - 0x16F6 = 0x1000.
 # Physical address = segment * 16. So, 0x1000 * 16 = 0x10000.
 LOAD_BASE_PARAGRAPH = 0x1000
 LOAD_CODE_PHYSICAL_BASE = LOAD_BASE_PARAGRAPH * 16
 
-# These will be populated by hooks during emulation
-initial_copy_dest_start = 0  # Physical address where the initial decompressor copy lands
-initial_copy_size = 0        # Size of the initial decompressor copy
+UNPACKED_EXE_DUMPED = False # Flag to indicate if the EXE has been dumped
 
 # --- MZ Header Offsets (Standard DOS EXE) ---
 MZ_E_MAGIC_OFFSET = 0x00
@@ -30,56 +28,93 @@ MZ_E_IP_OFFSET = 0x14      # Initial IP value
 MZ_E_CS_OFFSET = 0x16      # Initial (relative) CS value
 MZ_E_LFARLC_OFFSET = 0x1C  # File address of relocation table (used for LZ91 marker)
 
+# --- LZEXE Header Offsets (relative to CS:0000 after load) ---
+# These values will be read from the LZEXE header *in memory* at the time of final jump.
+LZEXE_REAL_IP_OFFSET = 0x00
+LZEXE_REAL_CS_OFFSET = 0x02
+LZEXE_REAL_SP_OFFSET = 0x04
+LZEXE_REAL_SS_OFFSET = 0x06
+# These are read from the LZEXE header *in the original file*
+LZEXE_COMPRESSED_SIZE_PARAGRAPHS_OFFSET = 0x08
+LZEXE_ADDITIONAL_SIZE_PARAGRAPHS_OFFSET = 0x0A
+LZEXE_DECOMPRESSOR_CODE_SIZE_BYTES_OFFSET = 0x0C
+
 # --- Unicorn Hooks ---
 
 def hook_code(uc, address, size, user_data):
     """
-    Hook for instructions to detect key decompression stages.
+    Hook for instructions to detect the final JMPF and dump the unpacked EXE.
     """
-    global initial_copy_dest_start, initial_copy_size
+    global UNPACKED_EXE_DUMPED
     
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
     physical_address = current_cs * 16 + current_ip
 
-    # Optional: Uncomment for detailed instruction trace (can be very verbose)
-    try:
-       ins_bytes = uc.mem_read(physical_address, size).hex()
-       print(f"Executing {physical_address:X}: {ins_bytes}")
-    except UcError:
-       print(f"Executing {physical_address:X}: (could not read bytes)")
-    
-    # The instruction `MOV CX,word ptr [0xc]` is at 26f6:0011 (physical 0x26F71).
-    # This reads the LZEXE header's 'Ch' field (size of decompressor).
-    # DS is 0x26F6 at this point due to `PUSH CS; POP DS` earlier.
-    if current_cs == 0x26F6 and current_ip == 0x11:
-        ds_val = uc.reg_read(UC_X86_REG_DS)
-        lzexe_header_ch_physical_addr = ds_val * 16 + 0x0C
-        try:
-            initial_copy_size = struct.unpack("<H", uc.mem_read(lzexe_header_ch_physical_addr, 2))[0]
-            print(f"[*] MOV CX, [DS:0x0C] (physical 0x{lzexe_header_ch_physical_addr:X}) executed. CX read as {hex(initial_copy_size)} (LZEXE header Ch field).")
-        except UcError as e:
-            print(f"[!] Error reading LZEXE header Ch value from memory at {hex(lzexe_header_ch_physical_addr)}: {e}")
-            # Fallback to hardcoded value for fgodmom.exe (0x0FD8) if read fails
-            # This should ideally not be needed if memory is mapped correctly
-            initial_copy_size = 0x0FD8 
-            print(f"    Using hardcoded initial_copy_size: {hex(initial_copy_size)}")
+    # The final JMPF instruction is at a specific offset within the decompressor's segment.
+    # The user_data['final_jmp_addr'] is pre-calculated to hit this exact instruction.
+    if physical_address == user_data['final_jmp_addr'] and not UNPACKED_EXE_DUMPED:
+        return 
+        print(f"[*] Reached final JMPF instruction at {hex(physical_address)}. Attempting to dump unpacked EXE.")
+        
+        # The LZEXE header (the *copied* one) is at the beginning of the current CS segment.
+        lzexe_header_base_phys = current_cs * 16
+        
+        # Read the "real" entry point and stack values from the LZEXE header in memory.
+        # These values have already been adjusted by the LZEXE relocation routine.
+        real_ip = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_IP_OFFSET, 2))[0]
+        real_cs = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_CS_OFFSET, 2))[0]
+        real_sp = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_SP_OFFSET, 2))[0]
+        real_ss = struct.unpack("<H", uc.mem_read(lzexe_header_base_phys + LZEXE_REAL_SS_OFFSET, 2))[0]
 
-    # The RETF at 26f6:002a is crucial for identifying the jump to the new decompressor copy.
-    # The code pushes BX (which holds the new ES/CS segment) and AX (the new IP, 0x2B) before RETF.
-    if current_cs == 0x26F6 and current_ip == 0x2A: 
-        # ES was calculated as DS (original CS) + LZEXE header[Ah] (additional size for decompression).
-        # For fgodmom.exe: 0x26F6 + 0x19A0 = 0x4096.
-        initial_copy_dest_start = uc.reg_read(UC_X86_REG_ES) * 16 # ES should be 0x4096 by this point
+        print(f"    Unpacked entry point (real CS:IP): {hex(real_cs)}:{hex(real_ip)}")
+        print(f"    Unpacked stack (real SS:SP): {hex(real_ss)}:{hex(real_sp)}")
         
-        ss_val = uc.reg_read(UC_X86_REG_SS)
-        sp_val = uc.reg_read(UC_X86_REG_SP)
-        # Stack grows downwards. New IP is at SS:SP, New CS is at SS:SP+2.
-        new_ip = struct.unpack("<H", uc.mem_read(ss_val * 16 + sp_val, 2))[0]
-        new_cs = struct.unpack("<H", uc.mem_read(ss_val * 16 + sp_val + 2, 2))[0]
-        
-        print(f"[*] Reached initial RETF at {hex(current_cs)}:{hex(current_ip)}. Next CS:IP will be {hex(new_cs)}:{hex(new_ip)}.")
-        print(f"[*] Initial decompressor block copied to {hex(initial_copy_dest_start)} with size {hex(initial_copy_size)}.")
+        # The base of the decompressed program is (PSP_SEGMENT + 0x10) * 16.
+        # DS points to the PSP segment right before the final jump.
+        psp_segment = uc.reg_read(UC_X86_REG_DS) 
+        unpacked_program_base_phys = (psp_segment + 0x10) * 16
+        print(f"    Unpacked program base physical address: {hex(unpacked_program_base_phys)}")
+
+        # Read the MZ header of the unpacked program from memory
+        try:
+            unpacked_mz_header_in_mem = uc.mem_read(unpacked_program_base_phys, 0x40) # Read 64 bytes for header fields
+            p_e_magic = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_MAGIC_OFFSET:MZ_E_MAGIC_OFFSET+2])[0]
+            p_e_cblp = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_CBLP_OFFSET:MZ_E_CBLP_OFFSET+2])[0]
+            p_e_cp = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_CP_OFFSET:MZ_E_CP_OFFSET+2])[0]
+            p_e_cparhdr = struct.unpack("<H", unpacked_mz_header_in_mem[MZ_E_CPARHDR_OFFSET:MZ_E_CPARHDR_OFFSET+2])[0]
+
+            if p_e_magic != 0x5A4D:
+                print(f"[!] Warning: MZ magic not found at unpacked base: {hex(p_e_magic)}")
+                # Fallback: estimate size based on stack address if MZ header is missing/corrupt
+                unpacked_size = real_ss * 16 - unpacked_program_base_phys 
+                print(f"    Estimated unpacked size (based on SS): {unpacked_size} bytes")
+            else:
+                # Calculate the total size of the unpacked executable image (header + code/data)
+                # This is the standard DOS formula for image size in bytes.
+                unpacked_size = (p_e_cp - 1) * 512 + p_e_cblp if p_e_cblp != 0 else p_e_cp * 512
+                print(f"    Unpacked MZ header found. e_cparhdr: {p_e_cparhdr}, e_cp: {p_e_cp}, e_cblp: {p_e_cblp}")
+                print(f"    Calculated unpacked EXE image size: {unpacked_size} bytes")
+
+            unpacked_size = 0x40000
+
+            # Dump the memory
+            if unpacked_size > 0:
+                extracted_data = uc.mem_read(unpacked_program_base_phys, unpacked_size)
+                output_filename = FILENAME.replace(".exe", "_unpacked.exe")
+                with open(output_filename, 'wb') as f:
+                    f.write(extracted_data)
+                print(f"[*] Successfully extracted unpacked EXE to '{output_filename}'")
+                UNPACKED_EXE_DUMPED = True # Set flag to prevent re-dumping
+            else:
+                print("[!] Unpacked size calculated as 0 or negative. Not dumping.")
+        except UcError as e:
+            print(f"[!] Error reading unpacked MZ header or data from memory: {e}")
+        except Exception as e:
+            print(f"[!] An unexpected error occurred during dump: {e}")
+
+        # Stop emulation after dumping
+        uc.emu_stop()
 
 
 def hook_mem_unmapped(uc, access, address, size, value, user_data):
@@ -101,16 +136,49 @@ def hook_mem_unmapped(uc, access, address, size, value, user_data):
     # Print more registers for debugging
     print(f"    EFLAGS: {hex(uc.reg_read(UC_X86_REG_EFLAGS))}")
     print(f"    AX: {hex(uc.reg_read(UC_X86_REG_AX))}, BX: {hex(uc.reg_read(UC_X86_REG_BX))}, CX: {hex(uc.reg_read(UC_X86_REG_CX))}, DX: {hex(uc.reg_read(UC_X86_REG_DX))}")
-    print(f"    SI: {hex(uc.reg_read(UC_X86_REG_SI))}, DI: {hex(uc.reg_read(UC_X86_REG_DI))}, BP: {hex(uc.reg_read(UC_X86_REG_BP))}")
+    print(f"    SI: {hex(uc.reg_read(UC_X86_REG_SI))}, DI: {hex(uc.reg_6read(UC_X86_REG_DI))}, BP: {hex(uc.reg_read(UC_X86_REG_BP))}")
     print(f"    DS: {hex(uc.reg_read(UC_X86_REG_DS))}, ES: {hex(uc.reg_read(UC_X86_REG_ES))}, SS: {hex(uc.reg_read(UC_X86_REG_SS))}, SP: {hex(uc.reg_read(UC_X86_REG_SP))}")
     
     return False # Return False to let Unicorn raise the error and stop emulation
 
+def hook_interrupt(uc, intno, user_data):
+    """
+    Hook for handling DOS interrupts.
+    """
+    if intno == 0x21:
+        ah = uc.reg_read(UC_X86_REG_AH)
+        if ah == 0x4C: # DOS function: Terminate with return code
+            print(f"[*] INT 21h, AH=4Ch (Terminate Program) detected. Stopping emulation.")
+            uc.emu_stop()
+        elif ah == 0x09: # DOS function: Print string
+            dx = uc.reg_read(UC_X86_REG_DX)
+            ds = uc.reg_read(UC_X86_REG_DS)
+            try:
+                # Read string until '$' (0x24) terminator
+                addr = ds * 16 + dx
+                s = b""
+                while True:
+                    byte = uc.mem_read(addr, 1)
+                    if byte[0] == 0x24: # '$' terminator
+                        break
+                    s += byte
+                    addr += 1
+                print(f"[*] INT 21h, AH=09h (Print String): {s.decode('ascii', errors='ignore')}")
+            except UcError:
+                print(f"[*] INT 21h, AH=09h (Print String): Failed to read string from {hex(ds)}:{hex(dx)}")
+            except Exception as e:
+                print(f"[*] INT 21h, AH=09h (Print String): Unexpected error: {e}")
+        else:
+            print(f"[*] Unhandled INT 21h function: AH={hex(ah)}. Continuing emulation.")
+    else:
+        print(f"[*] Unhandled interrupt: {hex(intno)}. Stopping emulation.")
+        uc.emu_stop()
+    
 
 # --- Main Extraction Function ---
 
 def extract_lz91_exe(filename):
-    global initial_copy_dest_start, initial_copy_size
+    global UNPACKED_EXE_DUMPED
 
     try:
         with open(filename, 'rb') as f:
@@ -131,35 +199,41 @@ def extract_lz91_exe(filename):
         return
 
     e_cparhdr = struct.unpack("<H", mz_header_file[MZ_E_CPARHDR_OFFSET:MZ_E_CPARHDR_OFFSET+2])[0]
-    e_cs_initial_header = struct.unpack("<H", mz_header_file[MZ_E_CS_OFFSET:MZ_E_CS_OFFSET+2])[0]
-    e_ip_initial_header = struct.unpack("<H", mz_header_file[MZ_E_IP_OFFSET:MZ_E_IP_OFFSET+2])[0]
-    e_ss_initial_header = struct.unpack("<H", mz_header_file[MZ_E_SS_OFFSET:MZ_E_SS_OFFSET+2])[0]
-    e_sp_initial_header = struct.unpack("<H", mz_header_file[MZ_E_SP_OFFSET:MZ_E_SP_OFFSET+2])[0]
-    e_minalloc = struct.unpack("<H", mz_header_file[MZ_E_MINALLOC_OFFSET:MZ_E_MINALLOC_OFFSET+2])[0]
-    e_maxalloc = struct.unpack("<H", mz_header_file[MZ_E_MAXALLOC_OFFSET:MZ_E_MAXALLOC_OFFSET+2])[0]
+    e_cs_initial_header_val = struct.unpack("<H", mz_header_file[MZ_E_CS_OFFSET:MZ_E_CS_OFFSET+2])[0]
+    e_ip_initial_header_val = struct.unpack("<H", mz_header_file[MZ_E_IP_OFFSET:MZ_E_IP_OFFSET+2])[0]
+    e_ss_initial_header_val = struct.unpack("<H", mz_header_file[MZ_E_SS_OFFSET:MZ_E_SS_OFFSET+2])[0]
+    e_sp_initial_header_val = struct.unpack("<H", mz_header_file[MZ_E_SP_OFFSET:MZ_E_SP_OFFSET+2])[0]
 
     print(f"[*] MZ Header values (from original file):")
     print(f"    e_cparhdr: {e_cparhdr} ({e_cparhdr * 16} bytes)")
-    print(f"    e_cs: {hex(e_cs_initial_header)}, e_ip: {hex(e_ip_initial_header)}")
-    print(f"    e_ss: {hex(e_ss_initial_header)}, e_sp: {hex(e_sp_initial_header)}")
-    print(f"    e_minalloc: {hex(e_minalloc)}, e_maxalloc: {hex(e_maxalloc)}")
+    print(f"    e_cs: {hex(e_cs_initial_header_val)}, e_ip: {hex(e_ip_initial_header_val)}")
+    print(f"    e_ss: {hex(e_ss_initial_header_val)}, e_sp: {hex(e_sp_initial_header_val)}")
 
     # Check LZ91 marker at 0x1C (e_lfarlc position)
     lz91_marker = mz_header_file[MZ_E_LFARLC_OFFSET:MZ_E_LFARLC_OFFSET+4]
     if lz91_marker == b'LZ91':
         print(f"[*] LZ91 marker 'LZ91' found at 0x{MZ_E_LFARLC_OFFSET:X}.")
     else:
-        print(f"[*] LZ91 marker not found at 0x{MZ_E_LFARLC_OFFSET:X}. Found: {lz91_marker}")
-        # Continue anyway, as the unpacking logic might still apply to similar packers
+        print(f"[*] LZ91 marker not found at 0x{MZ_E_LFARLC_OFFSET:X}. Found: {lz91_marker}. This might not be LZEXE.")
 
     # Calculate where the executable code/data actually starts in the file
     exe_start_offset_in_file = e_cparhdr * 16
     
+    # Read LZEXE header from file content (it's the first 14 bytes after MZ header)
+    lzexe_header_file = file_content[exe_start_offset_in_file : exe_start_offset_in_file + 14]
+    
+    lzexe_additional_size_pgphs = struct.unpack("<H", lzexe_header_file[LZEXE_ADDITIONAL_SIZE_PARAGRAPHS_OFFSET:LZEXE_ADDITIONAL_SIZE_PARAGRAPHS_OFFSET+2])[0]
+    lzexe_decompressor_code_size_bytes = struct.unpack("<H", lzexe_header_file[LZEXE_DECOMPRESSOR_CODE_SIZE_BYTES_OFFSET:LZEXE_DECOMPRESSOR_CODE_SIZE_BYTES_OFFSET+2])[0]
+
+    print(f"[*] LZEXE Header values (from original file):")
+    print(f"    Additional Size (pgphs): {hex(lzexe_additional_size_pgphs)}")
+    print(f"    Decompressor Code Size (bytes): {hex(lzexe_decompressor_code_size_bytes)}")
+
+
     # Initialize Unicorn Engine for x86 16-bit mode
     mu = Uc(UC_ARCH_X86, UC_MODE_16)
 
     # Map a 1MB contiguous region of memory for DOS conventional memory
-    # Max possible physical address in DOS 1MB conventional memory is 0x100000 - 1.
     TOTAL_MEM_SIZE = 0x100000 
     mu.mem_map(0, TOTAL_MEM_SIZE, UC_PROT_ALL)
     print(f"[*] Mapped total memory from 0x0 to {hex(TOTAL_MEM_SIZE)} ({TOTAL_MEM_SIZE // 1024} KB).")
@@ -170,44 +244,60 @@ def extract_lz91_exe(filename):
     print(f"[*] Loaded executable content from file offset {hex(exe_start_offset_in_file)} at physical address {hex(LOAD_CODE_PHYSICAL_BASE)}.")
     
     # Set up initial registers for the loader stub as DOS would.
-    # The observed CS (0x26F6) minus the e_cs from the header (0x16F6) gives the program's load segment (0x1000).
-    # The PSP is 0x10 paragraphs below the load segment.
+    # The PSP is 0x10 paragraphs below the program's load base segment.
     psp_segment = LOAD_BASE_PARAGRAPH - 0x10 
 
-    mu.reg_write(UC_X86_REG_CS, 0x26F6) # Observed initial CS from Ghidra
-    mu.reg_write(UC_X86_REG_IP, 0x000E) # Observed initial IP from Ghidra
-    mu.reg_write(UC_X86_REG_SS, 0x4194) # Observed initial SS from Ghidra
-    mu.reg_write(UC_X86_REG_SP, 0x0080) # Observed initial SP from Ghidra
+    # Initial CS value in the MZ header (e_cs) is relative to the load base.
+    # The actual CS register value will be LOAD_BASE_PARAGRAPH + e_cs.
+    initial_cs_segment_actual = LOAD_BASE_PARAGRAPH + e_cs_initial_header_val
+    initial_ip_offset_actual = e_ip_initial_header_val
+    initial_ss_segment_actual = LOAD_BASE_PARAGRAPH + e_ss_initial_header_val
+    initial_sp_offset_actual = e_sp_initial_header_val
+
+    mu.reg_write(UC_X86_REG_CS, initial_cs_segment_actual) 
+    mu.reg_write(UC_X86_REG_IP, initial_ip_offset_actual) 
+    mu.reg_write(UC_X86_REG_SS, initial_ss_segment_actual) 
+    mu.reg_write(UC_X86_REG_SP, initial_sp_offset_actual) 
     mu.reg_write(UC_X86_REG_DS, psp_segment) # DS and ES always point to PSP initially
     mu.reg_write(UC_X86_REG_ES, psp_segment) 
 
     # Set direction flag to clear (CLD). The program explicitly sets STD later.
     mu.reg_write(UC_X86_REG_EFLAGS, 0x202) # Set bit 9 (IF) and bit 1 (reserved). DF=0.
 
-    print(f"[*] Starting emulation at CS:IP = {hex(mu.reg_read(UC_X86_REG_CS))}:{hex(mu.reg_read(UC_X86_REG_IP))}")
+    print(f"[*] Initial Registers (as DOS would set them):")
+    print(f"    CS:IP = {hex(mu.reg_read(UC_X86_REG_CS))}:{hex(mu.reg_read(UC_X86_REG_IP))}")
+    print(f"    SS:SP = {hex(mu.reg_read(UC_X86_REG_SS))}:{hex(mu.reg_read(UC_X86_REG_SP))}")
+    print(f"    DS:ES (PSP Segment): {hex(psp_segment)}")
     print(f"    Physical start address: {hex(mu.reg_read(UC_X86_REG_CS) * 16 + mu.reg_read(UC_X86_REG_IP))}")
-    print(f"    Initial DS/ES (PSP Segment): {hex(psp_segment)}")
     
+    # Calculate the address of the final JMPF instruction
+    # The decompressor copies itself to: (initial_CS_segment_actual + lzexe_additional_size_pgphs)
+    # The final JMPF (from Ghidra's 4000:0ab5) is at offset 0xAB5 relative to the base of this *new* segment.
+    new_decompressor_segment = initial_cs_segment_actual + lzexe_additional_size_pgphs
+    FINAL_JMPF_OFFSET_IN_SEGMENT = 0xab5 
+    final_jmp_physical_addr = 0x4000 * 16 + FINAL_JMPF_OFFSET_IN_SEGMENT
+    print(f"[*] Calculated final JMPF hook address: {hex(final_jmp_physical_addr)}")
+
     # Add hooks
-    mu.hook_add(UC_HOOK_CODE, hook_code)
+    # Hook just the jmpf instruction. A JMPF is 3 bytes (opcode + segment:offset).
+    mu.hook_add(UC_HOOK_CODE, hook_code, begin=final_jmp_physical_addr, end=final_jmp_physical_addr + 3, user_data={'final_jmp_addr': final_jmp_physical_addr})
     mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED, hook_mem_unmapped)
     mu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hook_mem_unmapped)
     mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_unmapped)
+    mu.hook_add(UC_HOOK_INTR, hook_interrupt) # Hook for INT instructions (like INT 21h)
 
     try:
-        # Emulate until the program attempts to jump to the unpacked entry point,
-        # or an unmapped memory access (indicating decompression is done or failed).
-        # Set a generous instruction count limit to ensure completion.
+        # Emulate until the program either stops itself (INT 21h, AH=4Ch)
+        # or the final JMPF is hit (which triggers the dump and stops emulation).
         mu.emu_start(mu.reg_read(UC_X86_REG_CS) * 16 + mu.reg_read(UC_X86_REG_IP), 
                      TOTAL_MEM_SIZE, 
                      timeout=0,      # No timeout, runs until stop or error
-                     count=50000000) # Max 50 million instructions
-        print("[*] Emulation finished (possibly due to instruction count or exit).")
+                     count=50000000) # Max 50 million instructions, a safe upper bound
+        print("[*] Emulation finished (possibly due to instruction count or exit hook).")
 
     except UcError as e:
         print(f"[*] Emulation stopped with error: {e}")
-        # Register values are already printed by hook_mem_unmapped if it was a memory error.
-        # Otherwise, print them here for general errors.
+        # Print registers for debugging if not already handled by a specific hook
         if not str(e).startswith("UC_ERR_MEM_UNMAPPED"):
             print(f"    CS:IP = {hex(mu.reg_read(UC_X86_REG_CS))}:{hex(mu.reg_read(UC_X86_REG_IP))}")
             print(f"    EFLAGS: {hex(mu.reg_read(UC_X86_REG_EFLAGS))}")
@@ -215,82 +305,8 @@ def extract_lz91_exe(filename):
             print(f"    SI: {hex(mu.reg_read(UC_X86_REG_SI))}, DI: {hex(mu.reg_read(UC_X86_REG_DI))}, BP: {hex(mu.reg_read(UC_X86_REG_BP))}")
             print(f"    DS: {hex(mu.reg_read(UC_X86_REG_DS))}, ES: {hex(mu.reg_read(UC_X86_REG_ES))}, SS: {hex(mu.reg_read(UC_X86_REG_SS))}, SP: {hex(mu.reg_read(UC_X86_REG_SP))}")
 
-
-    # After emulation, the decompressed EXE should be at the initial load base address (0x10000).
-    print("\n[*] Searching for 'MZ' header in memory...")
-    
-    search_start_addr = LOAD_CODE_PHYSICAL_BASE 
-    search_end_addr = TOTAL_MEM_SIZE 
-    
-    mz_signature = b'MZ'
-    found_mz_headers = []
-
-    # Iterate through memory in chunks to find MZ headers
-    chunk_size = 0x10000 # Search in 64KB chunks
-    for current_addr in range(search_start_addr, search_end_addr, chunk_size):
-        try:
-            mem_chunk = mu.mem_read(current_addr, min(chunk_size, search_end_addr - current_addr))
-            
-            offset = 0
-            while True:
-                idx = mem_chunk.find(mz_signature, offset)
-                if idx == -1:
-                    break
-                
-                found_addr = current_addr + idx
-                
-                # Verify it's a valid MZ header by checking e_magic and e_cparhdr (header size)
-                try:
-                    potential_header = mu.mem_read(found_addr, 0x40) # Read 64 bytes for header fields
-                    
-                    p_e_magic = struct.unpack("<H", potential_header[MZ_E_MAGIC_OFFSET:MZ_E_MAGIC_OFFSET+2])[0]
-                    p_e_cparhdr = struct.unpack("<H", potential_header[MZ_E_CPARHDR_OFFSET:MZ_E_CPARHDR_OFFSET+2])[0]
-
-                    # Sanity checks: e_magic must be MZ, header size > 0 and reasonable (e.g., < 0x200 paragraphs = 512 bytes)
-                    if p_e_magic == 0x5A4D and p_e_cparhdr > 0 and p_e_cparhdr < 0x200: 
-                        print(f"  Found potential MZ header at physical address {hex(found_addr)}")
-                        found_mz_headers.append((found_addr, p_e_cparhdr))
-                except Exception:
-                    pass # Not a valid header or not enough bytes, continue
-
-                offset = idx + 1 # Continue search after this 'MZ'
-        except UcError as e:
-            print(f"Error reading memory at {hex(current_addr)} during MZ search: {e}")
-            break
-
-    if not found_mz_headers:
-        print("[!] No valid MZ headers found in memory after emulation. Decompression might have failed or output is non-standard.")
-        return
-
-    # Assume the first found MZ header closest to the original load base is the unpacked EXE.
-    best_match_addr = sorted(found_mz_headers, key=lambda x: abs(x[0] - LOAD_CODE_PHYSICAL_BASE))[0][0]
-    
-    # Read the header of the identified unpacked executable from memory
-    unpacked_header = mu.mem_read(best_match_addr, 0x40)
-    p_e_cblp = struct.unpack("<H", unpacked_header[MZ_E_CBLP_OFFSET:MZ_E_CBLP_OFFSET+2])[0]
-    p_e_cp = struct.unpack("<H", unpacked_header[MZ_E_CP_OFFSET:MZ_E_CP_OFFSET+2])[0]
-    p_e_cparhdr_unpacked = struct.unpack("<H", unpacked_header[MZ_E_CPARHDR_OFFSET:MZ_E_CPARHDR_OFFSET+2])[0]
-
-    # Calculate the total size of the unpacked executable image (header + code/data)
-    # This is the standard DOS formula for image size in bytes.
-    image_size_in_bytes = (p_e_cp - 1) * 512 + p_e_cblp if p_e_cblp != 0 else p_e_cp * 512
-
-    print(f"[*] Identified unpacked EXE at {hex(best_match_addr)}")
-    print(f"    Unpacked e_cparhdr: {p_e_cparhdr_unpacked} ({p_e_cparhdr_unpacked * 16} bytes)")
-    print(f"    Unpacked e_cp: {hex(p_e_cp)}, e_cblp: {hex(p_e_cblp)}")
-    print(f"[*] Estimated decompressed EXE size (image size in bytes): {image_size_in_bytes} bytes")
-
-    if best_match_addr is not None and image_size_in_bytes > 0:
-        try:
-            extracted_data = mu.mem_read(best_match_addr, image_size_in_bytes)
-            output_filename = filename.replace(".exe", "_unpacked.exe")
-            with open(output_filename, 'wb') as f:
-                f.write(extracted_data)
-            print(f"[*] Successfully extracted unpacked EXE to '{output_filename}'")
-        except UcError as e:
-            print(f"Error reading extracted data from memory: {e}")
-    else:
-        print("[!] Could not determine the location or size of the unpacked executable for dumping.")
+    if not UNPACKED_EXE_DUMPED:
+        print("[!] Unpacked EXE was not dumped. Check emulation log for errors or unhandled conditions.")
 
 # --- Script Execution ---
 if __name__ == "__main__":
