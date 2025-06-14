@@ -1,5 +1,3 @@
-# --- START OF FILE bios.py ---
-
 import struct
 import time
 import collections # For deque, a double-ended queue for keyboard buffer
@@ -67,6 +65,7 @@ VGA_PALETTE_256_COLORS = [(i, i, i) for i in range(256)]
 
 class VGAEmulator:
     def __init__(self, uc_emulator):
+        self.written_mem = {}
         self.uc = uc_emulator
         self.screen = None
         self.current_mode = None
@@ -280,7 +279,33 @@ class VGAEmulator:
             print(f"    Warning: Tried to write text in graphics mode. Skipping.")
             return
 
-        vram_addr = self.vram_base + (row * self.chars_per_row + col) * 2 # 2 bytes per char (char, attr)
+        # Ensure coordinates are within bounds before writing to VRAM
+        if not (0 <= row < self.rows and 0 <= col < self.chars_per_row):
+            # print(f"    Warning: Tried to write char at out-of-bounds position ({row},{col}). Skipping.")
+            return
+
+        # Calculate the starting address for the character and attribute pair
+        # Each page is chars_per_row * rows * 2 bytes long.
+        page_size = self.chars_per_row * self.rows * 2
+        
+        # Check if the requested page is valid based on typical VRAM size for text modes
+        # A common text VRAM region is 32KB (0xB8000 - 0xBFFFF).
+        # With 80x25 (4000 bytes/page), max 8 pages fit. With 40x25 (2000 bytes/page), max 16 pages fit.
+        # Let's cap pages to 8 for now.
+        max_pages = 8 # A reasonable max for standard 32KB text VRAM
+        if not (0 <= page < max_pages):
+            print(f"    Warning: Tried to write char to out-of-bounds page {page}. Skipping.")
+            return
+
+        vram_addr = self.vram_base + (page * page_size) + (row * self.chars_per_row + col) * 2 # 2 bytes per char (char, attr)
+        
+        # Ensure the write doesn't exceed the total VGA_MEM_SIZE
+        if vram_addr + (count * 2) > (self.vram_base + VGA_MEM_SIZE):
+            print(f"    Warning: VRAM write out of total mapped memory range at {hex(vram_addr)}. Truncating.")
+            count = (self.vram_base + VGA_MEM_SIZE - vram_addr) // 2
+            if count <= 0:
+                return
+
         for _ in range(count):
             try:
                 self.uc.mem_write(vram_addr, bytes([char_code, attribute]))
@@ -326,7 +351,24 @@ class VGAEmulator:
             print(f"    Warning: Tried to read char/attr in graphics mode. Skipping.")
             return 0x20, 0x07 # Space, light gray
 
-        vram_addr = self.vram_base + (row * self.chars_per_row + col) * 2
+        if not (0 <= row < self.rows and 0 <= col < self.chars_per_row):
+            # print(f"    Warning: Tried to read char at out-of-bounds position ({row},{col}). Returning default.")
+            return 0x20, 0x07
+
+        page_size = self.chars_per_row * self.rows * 2
+        max_pages = 8 # A reasonable max for standard 32KB text VRAM
+        if not (0 <= page < max_pages):
+            print(f"    Warning: Tried to read char from out-of-bounds page {page}. Returning default.")
+            return 0x20, 0x07
+
+
+        vram_addr = self.vram_base + (page * page_size) + (row * self.chars_per_row + col) * 2
+        
+        # Ensure the read doesn't exceed the total VGA_MEM_SIZE
+        if vram_addr + 2 > (self.vram_base + VGA_MEM_SIZE):
+            print(f"    Warning: VRAM read out of total mapped memory range at {hex(vram_addr)}. Returning default.")
+            return 0x20, 0x07
+
         try:
             data = self.uc.mem_read(vram_addr, 2)
             char_code = data[0]
@@ -342,6 +384,16 @@ class VGAEmulator:
             print(f"    Warning: Tried to scroll in graphics mode. Skipping.")
             return
         
+        # Clamp coordinates to screen dimensions
+        row_ul = max(0, min(row_ul, self.rows - 1))
+        col_ul = max(0, min(col_ul, self.chars_per_row - 1))
+        row_lr = max(0, min(row_lr, self.rows - 1))
+        col_lr = max(0, min(col_lr, self.chars_per_row - 1))
+
+        # Ensure UL is indeed Upper-Left and LR is Lower-Right
+        row_ul, row_lr = min(row_ul, row_lr), max(row_ul, row_lr)
+        col_ul, col_lr = min(col_ul, col_lr), max(col_ul, col_lr)
+
         if num_lines == 0: # Clear entire window
             for r in range(row_ul, row_lr + 1):
                 for c in range(col_ul, col_lr + 1):
@@ -351,15 +403,27 @@ class VGAEmulator:
         window_height = row_lr - row_ul + 1
         window_width = col_lr - col_ul + 1
 
+        if window_height <= 0 or window_width <= 0:
+            return # Invalid window
+
+        bytes_per_row_in_window = window_width * 2
+        
+        page_offset = self.active_page * self.chars_per_row * self.rows * 2
+
         if direction == "up":
             # Move lines up
             for r in range(row_ul, row_lr + 1 - num_lines):
                 # Copy line (r + num_lines) to line r
-                src_vram_start = self.vram_base + ((r + num_lines) * self.chars_per_row + col_ul) * 2
-                dest_vram_start = self.vram_base + (r * self.chars_per_row + col_ul) * 2
+                src_vram_start = self.vram_base + page_offset + ((r + num_lines) * self.chars_per_row + col_ul) * 2
+                dest_vram_start = self.vram_base + page_offset + (r * self.chars_per_row + col_ul) * 2
                 try:
-                    line_data = self.uc.mem_read(src_vram_start, window_width * 2)
-                    self.uc.mem_write(dest_vram_start, line_data)
+                    # Check if read/write are within mapped memory
+                    if src_vram_start + bytes_per_row_in_window <= self.vram_base + VGA_MEM_SIZE and \
+                       dest_vram_start + bytes_per_row_in_window <= self.vram_base + VGA_MEM_SIZE:
+                        line_data = self.uc.mem_read(src_vram_start, bytes_per_row_in_window)
+                        self.uc.mem_write(dest_vram_start, line_data)
+                    else:
+                        print(f"    Warning: Scroll up VRAM copy out of mapped memory range. Skipping line.")
                 except UcError as e:
                     print(f"    Error during scroll-up memory copy: {e}")
 
@@ -371,11 +435,16 @@ class VGAEmulator:
             # Move lines down
             for r in range(row_lr, row_ul + num_lines - 1, -1):
                 # Copy line (r - num_lines) to line r
-                src_vram_start = self.vram_base + ((r - num_lines) * self.chars_per_row + col_ul) * 2
-                dest_vram_start = self.vram_base + (r * self.chars_per_row + col_ul) * 2
+                src_vram_start = self.vram_base + page_offset + ((r - num_lines) * self.chars_per_row + col_ul) * 2
+                dest_vram_start = self.vram_base + page_offset + (r * self.chars_per_row + col_ul) * 2
                 try:
-                    line_data = self.uc.mem_read(src_vram_start, window_width * 2)
-                    self.uc.mem_write(dest_vram_start, line_data)
+                    # Check if read/write are within mapped memory
+                    if src_vram_start + bytes_per_row_in_window <= self.vram_base + VGA_MEM_SIZE and \
+                       dest_vram_start + bytes_per_row_in_window <= self.vram_base + VGA_MEM_SIZE:
+                        line_data = self.uc.mem_read(src_vram_start, bytes_per_row_in_window)
+                        self.uc.mem_write(dest_vram_start, line_data)
+                    else:
+                        print(f"    Warning: Scroll down VRAM copy out of mapped memory range. Skipping line.")
                 except UcError as e:
                     print(f"    Error during scroll-down memory copy: {e}")
 
@@ -392,15 +461,18 @@ class VGAEmulator:
 
         if self.is_text_mode:
             # Text mode rendering (e.g., 80x25, 40x25)
-            try:
-                # Read the entire visible VRAM area for the active page
-                # For 80x25, it's 80 * 25 * 2 bytes = 4000 bytes.
-                vram_data = self.uc.mem_read(self.vram_base + (self.active_page * self.chars_per_row * self.rows * 2),
-                                             self.chars_per_row * self.rows * 2)
-                # DEBUG: Print a small chunk of VRAM to see if data is there
-                # if vram_data[0] != 0x00 or vram_data[1] != 0x00: # Only print if first char is not blank
-                #     print(f"DEBUG: VRAM start ({hex(self.vram_base)}): Char {vram_data[0]:X}, Attr {vram_data[1]:X}")
+            page_size = self.chars_per_row * self.rows * 2
+            vram_page_start_addr = self.vram_base + (self.active_page * page_size)
+            vram_page_start_addr = 0xB8000 + 0xFA0 * 4
+            
+            # Ensure the read does not go beyond mapped memory
+            read_size = page_size
+            if vram_page_start_addr + read_size > self.vram_base + VGA_MEM_SIZE:
+                read_size = self.vram_base + VGA_MEM_SIZE - vram_page_start_addr
+                if read_size < 0: read_size = 0
 
+            try:
+                vram_data = self.uc.mem_read(vram_page_start_addr, read_size)
             except UcError as e:
                 print(f"    Error reading VRAM for rendering: {e}. Skipping render.")
                 return
@@ -409,6 +481,8 @@ class VGAEmulator:
             for row in range(self.rows):
                 for col in range(self.chars_per_row):
                     offset = (row * self.chars_per_row + col) * 2
+                    if offset + 1 >= len(vram_data): # Check bounds
+                        break # Out of VRAM data for this page, stop rendering
                     char_code = vram_data[offset]
                     attribute = vram_data[offset + 1]
 
@@ -445,7 +519,12 @@ class VGAEmulator:
         else: # Graphics mode rendering (e.g., 320x200, 256 colors)
             try:
                 # Read the entire graphics VRAM area
-                vram_data = self.uc.mem_read(self.vram_base, self.display_width * self.display_height)
+                # For graphics mode, VRAM_GRAPHICS_MODE to VRAM_GRAPHICS_MODE + display_width * display_height
+                read_size = self.display_width * self.display_height
+                if self.vram_base + read_size > self.vram_base + VGA_MEM_SIZE:
+                    read_size = self.vram_base + VGA_MEM_SIZE - self.vram_base
+                    if read_size < 0: read_size = 0
+                vram_data = self.uc.mem_read(self.vram_base, read_size)
             except UcError as e:
                 print(f"    Error reading VRAM for rendering: {e}. Skipping render.")
                 return
@@ -457,6 +536,8 @@ class VGAEmulator:
             for y in range(self.display_height):
                 for x in range(self.display_width):
                     offset = y * self.display_width + x
+                    if offset >= len(vram_data): # Check bounds
+                        break # Out of VRAM data, stop rendering
                     color_index = vram_data[offset]
                     color_rgb = VGA_PALETTE_256_COLORS[color_index]
                     self.screen.set_at((x, y), color_rgb)
@@ -506,6 +587,9 @@ class VGAEmulator:
                 elif event.key == pygame.K_F1:
                     ascii_val = 0x00
                     scan_code = 0x3B # F1 scan code
+                elif event.key == pygame.K_F12: # New debug key for dumping pages
+                    self.dump_all_text_pages_to_console()
+                    return True # Don't add F12 to keyboard buffer, just use for debug
                 # Add more special keys as needed for the game
 
                 print("storing ascii", hex(ascii_val), "scan_code", hex(scan_code))
@@ -609,6 +693,74 @@ class VGAEmulator:
         self._write_bios_kb_ptr(KB_BUFFER_TAIL_PTR, KB_BUFFER_START_OFFSET)
         print("    BIOS Keyboard buffer flushed.")
 
+    def dump_all_text_pages_to_console(self):
+        """
+        Dumps the content of all available text video pages to the console.
+        Non-zero characters are drawn as themselves (CP437), zero/control chars as '.'.
+        """
+        if not self.is_text_mode:
+            print("\n--- Cannot dump text pages: Currently in graphics mode. ---")
+            return
+
+        print("\n" + "=" * (self.chars_per_row + 10))
+        print(f"--- DUMPING ALL TEXT PAGES (Mode {hex(self.current_mode)}, {self.chars_per_row}x{self.rows}) ---")
+        
+        page_size_bytes = self.chars_per_row * self.rows * 2
+        
+        # Determine number of pages to dump.
+        # Standard text VRAM region (0xB8000 to 0xBFFF) is 32KB (0x8000 bytes).
+        # This allows 8 pages of 80x25 (4000 bytes/page) or 16 pages of 40x25 (2000 bytes/page).
+        # We will dump up to 8 pages as a common useful range for debugging.
+        num_pages_to_dump = 8 
+
+        for page_num in range(num_pages_to_dump):
+            page_start_addr = self.vram_base + (page_num * page_size_bytes)
+            
+            # Check if this page address is within the overall mapped VGA_MEM_SIZE
+            # The text VRAM starts at 0xB8000, and VGA_MEM_SIZE is 0x20000.
+            # So, the accessible range is 0xB8000 to 0xB8000 + 0x20000 - 1 = 0xD7FFF.
+            if page_start_addr >= (self.vram_base + VGA_MEM_SIZE):
+                print(f"--- Page {page_num} ({hex(page_start_addr)}) is beyond mapped VRAM. Stopping. ---")
+                break
+
+            # Calculate actual read size for the page, clamped by total mapped VRAM.
+            read_size_for_page = min(page_size_bytes, (self.vram_base + VGA_MEM_SIZE) - page_start_addr)
+            if read_size_for_page <= 0:
+                print(f"--- Page {page_num} ({hex(page_start_addr)}) cannot be read (size {read_size_for_page}). Stopping. ---")
+                break
+
+            try:
+                vram_data = self.uc.mem_read(page_start_addr, read_size_for_page)
+            except UcError as e:
+                print(f"--- Error reading VRAM for page {page_num} at {hex(page_start_addr)}: {e}. Skipping page. ---")
+                continue
+
+            print(f"\n--- Page {page_num} (VRAM {hex(page_start_addr)}) (Active Page: {'YES' if page_num == self.active_page else 'NO'}) ---")
+            for r in range(self.rows):
+                row_string = ""
+                for c in range(self.chars_per_row):
+                    offset = (r * self.chars_per_row + c) * 2
+                    # Ensure we don't read past the end of actual data read for the page
+                    if offset + 1 >= len(vram_data): 
+                        char_code = 0x20 # Default to space if data incomplete
+                    else:
+                        char_code = vram_data[offset]
+                    
+                    # Convert char_code to printable character, handling non-zero and control chars
+                    if char_code == 0x00:
+                        display_char = ' ' # Space for null (zero character)
+                    elif 0x01 <= char_code <= 0x1F or char_code == 0x7F: # Control characters (and DEL)
+                        display_char = '.' # Dot for non-printable control characters
+                    else:
+                        try:
+                            # Use CP437 decoding for DOS characters (non-zero character)
+                            display_char = bytes([char_code]).decode('cp437', errors='replace')
+                        except Exception:
+                            display_char = '?' # Fallback for decoding errors
+                    row_string += display_char
+                print(row_string)
+            print("-" * self.chars_per_row)
+        print("=" * (self.chars_per_row + 10) + "\n")
 
 
 # Define some placeholder addresses and values for demonstration.
@@ -719,7 +871,7 @@ def handle_int10(uc, vga_emulator):
     ah = uc.reg_read(UC_X86_REG_AH)
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
-    print(f"[*] INT 10h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
+    print(f"[*] INT 10h, AH={ah:02X} {current_cs:X}:{current_ip:X} ")
 
     if ah == 0x00: # Set Video Mode
         al = uc.reg_read(UC_X86_REG_AL)
@@ -829,7 +981,7 @@ def handle_int10(uc, vga_emulator):
         uc.reg_write(UC_X86_REG_AL, current_mode_bda if current_mode_bda != 0 else vga_emulator.current_mode)
         uc.reg_write(UC_X86_REG_AH, vga_emulator.chars_per_row if vga_emulator.is_text_mode else 0) # Columns
         uc.reg_write(UC_X86_REG_BH, vga_emulator.active_page) # Display page
-        print(f"    Returning AL={hex(uc.reg_read(UC_X86_REG_AL))}, AH={hex(uc.reg_read(UC_X86_REG_AH))}, BH={hex(uc.reg_read(UC_X86_REG_BH))}")
+        print(f"    Returning AL={uc.reg_read(UC_X86_REG_AL):02X}, AH={uc.reg_read(UC_X86_REG_AH):02X}, BH={uc.reg_read(UC_X86_REG_BH):02X}")
 
     elif ah == 0x13: # Write string
         al = uc.reg_read(UC_X86_REG_AL) # Write mode (bit 0: update cursor, bit 1: string contains attributes)
@@ -889,7 +1041,7 @@ def handle_int10(uc, vga_emulator):
             print(f"    INT 10h, AH=12h, BL=20h (Select default palette loading). Acknowledged.")
             # No return values.
         else:
-            print(f"    Unhandled INT 10h function: AH={hex(ah)}, BL={hex(bl)}. Stopping emulation.")
+            print(f"    Unhandled INT 10h function: AH={ah:02X}, BL={bl:02X}. Stopping emulation.")
             uc.emu_stop()
     elif ah == 0x1A: # Read/Write Display Combination Code
         al = uc.reg_read(UC_X86_REG_AL)
@@ -899,7 +1051,7 @@ def handle_int10(uc, vga_emulator):
             uc.reg_write(UC_X86_REG_BL, 0x08) # Color mode
             print(f"    Get Display Combination Code: AL=1A, BH=00, BL=08 (VGA/MCGA Color).")
         else:
-             print(f"    Unhandled INT 10h, AH=1A, AL={hex(al)}. Stopping emulation.")
+             print(f"    Unhandled INT 10h, AH=1A, AL={al:02X}. Stopping emulation.")
              uc.emu_stop()
 
     elif ah == 0x10: # Palette/Color Register Functions
@@ -937,11 +1089,11 @@ def handle_int10(uc, vga_emulator):
                 print(f"    DAC Register {bx} out of bounds. Max {len(VGA_PALETTE_256_COLORS)-1}.")
         # ... more INT 10h AH=10h subfunctions as needed ...
         else:
-            print(f"    Unhandled INT 10h function: AH={hex(ah)}, AL={hex(al)}. Stopping emulation.")
+            print(f"    Unhandled INT 10h function: AH={ah:02X}, AL={al:02X}. Stopping emulation.")
             uc.emu_stop()
 
     else:
-        print(f"    Unhandled INT 10h function: AH={hex(ah)}. Stopping emulation.")
+        print(f"    Unhandled INT 10h function: AH={ah:02X}. Stopping emulation.") # Use :02X for hex print
         uc.emu_stop()
 
     # Ensure Carry Flag is cleared for success, set for error (if not already handled)
@@ -956,7 +1108,7 @@ def handle_int16(uc, vga_emulator):
     ah = uc.reg_read(UC_X86_REG_AH)
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
-    print(f"[*] INT 16h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
+    print(f"[*] INT 16h, AH={ah:02X} {current_cs:X}:{current_ip:X} ")
 
     if ah == 0x00: # Read Character from Keyboard
         key_data = vga_emulator.pop_key_from_bios_buffer()
@@ -982,7 +1134,7 @@ def handle_int16(uc, vga_emulator):
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
             eflags &= ~0x0040 # Clear ZF - key is available
             uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-            print(f"    Key available (INT 16h AH=01h): ASCII={hex(ascii_val)}, ScanCode={hex(scan_code)}")
+            print(f"    Key available (INT 16h AH=01h): ASCII={ascii_val:02X}, ScanCode={scan_code:02X}")
         else:
             uc.reg_write(UC_X86_REG_AX, 0x0000) # AX = 0, no key
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
@@ -998,7 +1150,7 @@ def handle_int16(uc, vga_emulator):
         # For a full emulator, you'd update this byte from Pygame modifier keys.
         shift_status = uc.mem_read(BIOS_DATA_AREA + 0x17, 1)[0] # Read current status
         uc.reg_write(UC_X86_REG_AL, shift_status)
-        print(f"    Get Shift Status (INT 16h AH=02h): AL={hex(shift_status)}")
+        print(f"    Get Shift Status (INT 16h AH=02h): AL={shift_status:02X}")
 
     elif ah == 0x05: # Keyboard Write (push key to buffer) - not usually called by programs
         # This function is used by keyboard drivers (e.g., INT 09h handler) to push keys.
@@ -1011,13 +1163,11 @@ def handle_int16(uc, vga_emulator):
             uc.reg_write(UC_X86_REG_AL, 0x01) # Success
         else:
             uc.reg_write(UC_X86_REG_AL, 0x00) # Buffer full
-        print(f"    Keyboard Write (INT 16h AH=05h): AX={hex(key_word)}, Success={success}")
+        print(f"    Keyboard Write (INT 16h AH=05h): AX={key_word:04X}, Success={success}")
 
     else:
-        print(f"    Unhandled INT 16h function: AH={hex(ah)}. Stopping emulation.")
+        print(f"    Unhandled INT 16h function: AH={ah:02X}. Stopping emulation.")
         uc.emu_stop()
 
     # No specific flags to set/clear by default for INT 16h after execution.
     # ZF for 01h is handled.
-
-
