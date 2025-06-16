@@ -9,7 +9,7 @@ defmodule CapstoneEx do
     use Rustler, otp_app: :capstone_ex, crate: "excap"
 
     # This is a fallback for when the NIF is not loaded.
-    def disassemble(_code, _arch, _mode), do: :erlang.nif_error(:nif_not_loaded)
+    def disassemble(_code, _arch, _mode, _base), do: :erlang.nif_error(:nif_not_loaded)
   end
 
   @doc """
@@ -40,7 +40,8 @@ defmodule CapstoneEx do
       iex> CapstoneEx.disassemble(<<0x00, 0x00, 0x00, 0x00>>, :unsupported, :mode64)
       {:error, "unsupported_architecture"}
   """
-  def disassemble(code, arch, mode) when is_binary(code) and is_atom(arch) and is_atom(mode) do
-    Native.disassemble(code, arch, mode)
+  def disassemble(code, arch, mode, base)
+      when is_binary(code) and is_atom(arch) and is_atom(mode) do
+    Native.disassemble(code, arch, mode, base)
   end
 end
