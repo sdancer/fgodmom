@@ -289,6 +289,29 @@ def hook_mem_write_low(uc, access, address, size, value, user_data):
     data_hex = "".join(f"{b:02x}" for b in data_written)
     print(f"[DEBUG_LOW_MEM_WRITE] CS:IP={hex(current_cs)}:{hex(current_ip)} writes to 0x{address:X} (size {size}), value_param={hex(value)}, data_written=0x{data_hex}")
 
+def hook_in(uc, port, size, user_data):
+    """
+    Handles an IN instruction.
+    Must return an integer that will be placed in AL/AX/EAX
+    depending on the access size (1, 2 or 4 bytes).
+    """
+    cs = uc.reg_read(UC_X86_REG_CS)
+    ip = uc.reg_read(UC_X86_REG_IP)
+    print(f"[IN ] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}")
+    #
+    # TODO: return a realistic value for the hardware you emulate.
+    # For now just return an open‑bus pattern.
+    #
+    return 0
+
+def hook_out(uc, port, size, value, user_data):
+    """
+    Handles an OUT instruction.
+    """
+    cs = uc.reg_read(UC_X86_REG_CS)
+    ip = uc.reg_read(UC_X86_REG_IP)
+    print(f"[OUT] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}  value=0x{value:X}")
+
 def extract_lz91_exe(filename):
     global UNPACKED_EXE_DUMPED
 
@@ -407,6 +430,8 @@ def extract_lz91_exe(filename):
                 begin=0, 
                 end=0x10000 - 1,
                 user_data={'vga_emulator': vga_emulator})
+    mu.hook_add(UC_HOOK_INSN,  hook_in,  None, 1, 0, UC_X86_INS_IN)
+    mu.hook_add(UC_HOOK_INSN,  hook_out, None, 1, 0, UC_X86_INS_OUT)
 
 
     # Emulation loop

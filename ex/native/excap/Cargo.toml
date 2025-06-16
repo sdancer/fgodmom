@@ -1,0 +1,13 @@
+[package]
+name = "excap"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "excap"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.32.0"
+capstone = "0.11.0"
