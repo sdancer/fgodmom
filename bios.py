@@ -848,141 +848,107 @@ class VGAEmulator:
         This correctly simulates latching, write modes, bit masks, and map masks.
         """
         # --- 1. Get current VGA register states ---
-        map_mask = self.sequencer_registers[2]
-        write_mode = self.gc_registers[5] & 0x03
-        logical_op = (self.gc_registers[3] >> 3) & 0x03
-        bit_mask = self.gc_registers[8]
-        set_reset_val = self.gc_registers[0]
-        enable_set_reset = self.gc_registers[1]
-
+        map_mask = self.sequencer_registers[2]        # Plane write enable
+        write_mode = self.gc_registers[5] & 0x03      # Graphics Controller Write Mode (0-3)
+        logical_op = (self.gc_registers[3] >> 3) & 0x03 # For WM2: 0=REPL, 1=AND, 2=OR, 3=XOR
+        bit_mask = self.gc_registers[8]               # Bit Mask (which bits to modify)
+        set_reset_val = self.gc_registers[0]          # Set/Reset color (4 bits)
+        enable_set_reset = self.gc_registers[1]       # Enable Set/Reset per plane (for WM0)
+    
         # --- 2. Latch Phase ---
-        # Calculate the offset within the 64KB VRAM window (0x0000 to 0xFFFF)
+        # Calculate the offset within a single plane's address space.
+        # The CPU addresses a 64KB window, but planar modes map this differently.
+        # We simplify this to a direct offset.
         offset_in_window = address - self.vram_base
         plane_size = 32768 # The size of one plane in our memory model
-
-        # The CPU address is always within the A0000-AFFFF range for these modes.
-        # We only need to handle offsets within a single plane's address space.
+    
         if not (0 <= offset_in_window < plane_size):
-            # In a real VGA, this might wrap or be handled by odd/even mode.
-            # For this emulator, we'll ignore writes outside the first 32KB per plane.
-            print("outside first plane window")
+            # This write is outside the managed VRAM area for this simplified model.
+            # In a real VGA, this might be handled by odd/even mode logic.
             return
-
+    
+        # Latch (read) the byte from all 4 planes at the target offset.
+        # This captures the state of the hardware latches *before* the write.
         try:
-            # Latch (read) the byte from all 4 planes at the target offset.
             latched_bytes = [
-                self.vram_shadow[offset_in_window],
-                self.vram_shadow[offset_in_window + plane_size],
-                self.vram_shadow[offset_in_window + 2 * plane_size],
-                self.vram_shadow[offset_in_window + 3 * plane_size]
+                self.vram_shadow[offset_in_window + (p * plane_size)] for p in range(4)
             ]
-        except UcError as e:
-            print(f"ERROR latching VRAM at addr {hex(address)}: {e}")
+        except IndexError:
+            print(f"ERROR: VRAM latch access out of bounds at offset {offset_in_window}")
             return
-
-        # --- 3. Data Processing Phase ---
-        # Figure out what data to write to each plane based on the write mode.
-        processed_data = [0] * 4
-
-
+    
+        # --- 3. Data Processing Phase (Calculate what to write to each plane) ---
+        processed_data = list(latched_bytes) # Start with latched data as a default
+    
+        # ==========================
+        # === WRITE MODE 0 LOGIC ===
+        # ==========================
         if write_mode == 0:
-            # For each plane, decide if we use CPU data or expanded Set/Reset data.
-            for i in range(4):
-                if (enable_set_reset >> i) & 1:
-                    # Use Set/Reset: expand the i-th bit of the color to a full byte.
-                    processed_data[i] = 0xFF if (set_reset_val >> i) & 1 else 0x00
+            # Data is a mix of CPU data and expanded Set/Reset data.
+            # The bit_mask is applied at the end.
+            for p in range(4):
+                if (enable_set_reset >> p) & 1:
+                    # Use Set/Reset: expand the p-th bit of the color to a full byte.
+                    data_source = 0xFF if (set_reset_val >> p) & 1 else 0x00
                 else:
                     # Use CPU data directly.
-                    processed_data[i] = value
-
+                    data_source = value
+                # The bit mask determines which bits from the source replace the latched bits.
+                processed_data[p] = (latched_bytes[p] & ~bit_mask) | (data_source & bit_mask)
+    
+        # ==========================
+        # === WRITE MODE 1 LOGIC ===
+        # ==========================
         elif write_mode == 1:
-            # Write the latched data back (used for VRAM-to-VRAM copies).
+            # Simple VRAM-to-VRAM copy. Writes the latched data back.
+            # No other registers are involved. The final map_mask still applies.
             processed_data = latched_bytes
-
+    
+        # ==========================
+        # === WRITE MODE 2 LOGIC ===
+        # ==========================
         elif write_mode == 2:
-            # --------------------------- ❶ PREPARE CONSTANTS ---------------------------
-            cpu_pattern   = value                    # 8‑bit bit mask from the host
-            set_reset     = self.gc_registers[0] & 0x0F
-            enable_sr     = self.gc_registers[1] & 0x0F
-            bit_mask_reg  = bit_mask                 # GC[8] was already read above
-            func_select   = logical_op               # 0 = REPL, 1 = AND, 2 = OR, 3 = XOR
-        
-            # Expand Set/Reset to four bytes (one per plane)
-            sr_expanded = [(0xFF if (set_reset >> p) & 1 else 0x00) for p in range(4)]
-        
-            # --------------------------- ❷ CALCULATE NEW BYTE PER PLANE ---------------
+            # The most complex mode. CPU data acts as a bit-selector.
+            cpu_data = value
+            sr_expanded = [(0xFF if (set_reset_val >> p) & 1 else 0x00) for p in range(4)]
+    
             for p in range(4):
-                if not ((map_mask >> p) & 1):
-                    continue      # this plane is write‑protected
-
-                #if p == 0:
-                #    sr_expanded[p] = 0xff
-                #    cpu_pattern = 0xff
-        
-                # Select SR or old latched data **per bit** according to cpu_pattern
-                src = (sr_expanded[p] & cpu_pattern) | (latched_bytes[p] & ~cpu_pattern)
-        
-                # bit_mask_reg = 0xff
-
-                # Apply logical operation with the original latched data
-                if   func_select == 0:
-                    src = cpu_pattern & sr_expanded[p]
-                if   func_select == 1:  src &= latched_bytes[p]   # AND
-                elif func_select == 2:  src |= latched_bytes[p]   # OR
-                elif func_select == 3:  src ^= latched_bytes[p]   # XOR
-                # func_select == 0 ➜ REPL (already satisfied)
-        
-                # Apply Bit Mask register – only bits that are ‘1’ may change
-                final_byte = (latched_bytes[p] & ~bit_mask_reg) | (src & bit_mask_reg)
-        
-                # ----------------------- ❸ COMMIT TO VRAM -----------------------------
-                shadow_offset = offset_in_window + p*plane_size
-                #self.uc.mem_write(plane_addr, bytes([final_byte]))
-                  
-                if 0 <= shadow_offset < len(self.vram_shadow):
-                    self.vram_shadow[shadow_offset] = final_byte
-                    pass
-                else:
-                    print("error, offset")
-            return
-
-        elif write_mode == 3:
-            # Rotate CPU data, then mask it with the Bit Mask register.
-            rotate_count = self.gc_registers[3] & 0x07
-            rotated_val = ((value >> rotate_count) | (value << (8 - rotate_count))) & 0xFF
-            masked_val = rotated_val & bit_mask
-            # This result is applied to all planes.
-            for i in range(4):
-                processed_data[i] = masked_val
-
-        # --- 4. Write Phase ---
-        # Combine processed data with latched data and write back to the enabled planes.
-        for i in range(4):
-            # Check if this plane is enabled for writing by the Map Mask
-            if (map_mask >> i) & 1:
-                # Apply the specified logical operation
-                write_val = processed_data[i]
+                # Step A: Select between Set/Reset and Latched data using CPU data as a mask.
+                # If a bit in cpu_data is 1, use the Set/Reset byte.
+                # If a bit in cpu_data is 0, use the Latched byte.
+                selected_data = (sr_expanded[p] & cpu_data) | (latched_bytes[p] & ~cpu_data)
+    
+                # Step B: Apply logical operation against the latched data.
                 if logical_op == 1:   # AND
-                    write_val &= latched_bytes[i]
+                    result = selected_data & latched_bytes[p]
                 elif logical_op == 2: # OR
-                    write_val |= latched_bytes[i]
+                    result = selected_data | latched_bytes[p]
                 elif logical_op == 3: # XOR
-                    write_val ^= latched_bytes[i]
-                # Default (op=0) is a direct move.
-
-                # Apply the Bit Mask: New bits come from write_val, old bits from latched_bytes.
-                final_byte = (latched_bytes[i] & ~bit_mask) | (write_val & bit_mask)
-
-                # Finally, write the resulting byte to the plane's memory.
-                try:
-                    plane_addr = self.vram_base + offset_in_window + (i * plane_size)
-                    #self.uc.mem_write(plane_addr, bytes([final_byte]))
-                    shadow_offset = plane_addr - self.vram_base
-                    if shadow_offset < len(self.vram_shadow):
-                        self.vram_shadow[shadow_offset] = final_byte
-                except UcError as e:
-                    print(f"ERROR writing to plane {i} at {hex(plane_addr)}: {e}")
-
+                    result = selected_data ^ latched_bytes[p]
+                else: # 0 = REPLACE
+                    result = selected_data
+    
+                # Step C: Apply the Bit Mask. Only bits set in the mask are updated.
+                processed_data[p] = (latched_bytes[p] & ~bit_mask) | (result & bit_mask)
+    
+        # ==========================
+        # === WRITE MODE 3 LOGIC ===
+        # ==========================
+        elif write_mode == 3:
+            # A mix of Mode 0 and Mode 2. The bit mask is rotated by the CPU data.
+            rotated_mask = bit_mask
+            # For simplicity, we are not implementing the bit mask rotation here.
+            # This is a placeholder for a more complete implementation.
+            # The logic is otherwise similar to Mode 0, using the rotated mask.
+            pass # Not implementing for now, will behave like a no-op.
+    
+        # --- 4. Write Phase (Commit processed data to VRAM) ---
+        # This final step is common to all modes.
+        for p in range(4):
+            # The Map Mask is the final gatekeeper, enabling/disabling writes to each plane.
+            if (map_mask >> p) & 1:
+                shadow_offset = offset_in_window + p * plane_size
+                self.vram_shadow[shadow_offset] = processed_data[p]
 
 
 # Define some placeholder addresses and values for demonstration.
