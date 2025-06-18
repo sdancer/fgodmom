@@ -896,10 +896,38 @@ class VGAEmulator:
             processed_data = latched_bytes
 
         elif write_mode == 2:
-            # CPU data's low 4 bits are a color. Expand this color to 4 plane bytes.
-            cpu_color = value & 0x0F
-            for i in range(4):
-                processed_data[i] = 0xFF if (cpu_color >> i) & 1 else 0x00
+            # --------------------------- ❶ PREPARE CONSTANTS ---------------------------
+            cpu_pattern   = value                    # 8‑bit bit mask from the host
+            set_reset     = self.gc_registers[0] & 0x0F
+            enable_sr     = self.gc_registers[1] & 0x0F
+            bit_mask_reg  = bit_mask                 # GC[8] was already read above
+            func_select   = logical_op               # 0 = REPL, 1 = AND, 2 = OR, 3 = XOR
+        
+            # Expand Set/Reset to four bytes (one per plane)
+            sr_expanded = [(0xFF if (set_reset >> p) & 1 else 0x00) for p in range(4)]
+        
+            # --------------------------- ❷ CALCULATE NEW BYTE PER PLANE ---------------
+            for p in range(4):
+                map_mask = 14 
+                if not ((map_mask >> p) & 1):
+                    continue      # this plane is write‑protected
+        
+                # Select SR or old latched data **per bit** according to cpu_pattern
+                src = (sr_expanded[p] & cpu_pattern) | (latched_bytes[p] & ~cpu_pattern)
+        
+                # Apply logical operation with the original latched data
+                if   func_select == 1:  src &= latched_bytes[p]   # AND
+                elif func_select == 2:  src |= latched_bytes[p]   # OR
+                elif func_select == 3:  src ^= latched_bytes[p]   # XOR
+                # func_select == 0 ➜ REPL (already satisfied)
+        
+                # Apply Bit Mask register – only bits that are ‘1’ may change
+                final_byte = (latched_bytes[p] & ~bit_mask_reg) | (src & bit_mask_reg)
+        
+                # ----------------------- ❸ COMMIT TO VRAM -----------------------------
+                plane_addr = self.vram_base + offset_in_window + p*plane_size
+                #self.uc.mem_write(plane_addr, bytes([final_byte]))
+            return
 
         elif write_mode == 3:
             # Rotate CPU data, then mask it with the Bit Mask register.
@@ -1171,7 +1199,8 @@ def _handle_int10_ah10_palette(uc, vga_emulator):
         palette_bytes = uc.mem_read(addr, 16)
         for i, val in enumerate(palette_bytes):
             vga_emulator.palette_16_color[i] = vga_emulator._decode_ega_palette_color(val)
-        #vga_emulator.palette_16_color = VGA_PALETTE_16_COLORS
+            if vga_emulator.palette_16_color[i] == 0:
+                vga_emulator.palette_16_color[i] = VGA_PALETTE_16_COLORS[i]
         print("      Palette updated successfully.")
         return True
     

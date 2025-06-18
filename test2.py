@@ -467,6 +467,7 @@ def hook_mem_write_vga(uc, access, address, size, value, user_data):
     Hook for writes to VGA memory. It now checks if the write was handled
     by the planar logic.
     """
+    return True
     if access == UC_MEM_WRITE:
         vga_emulator = user_data['vga_emulator']
         
@@ -481,7 +482,7 @@ def hook_mem_write_vga(uc, access, address, size, value, user_data):
             # The write was not handled by our custom logic (e.g., text mode).
             # We let the hook fall through, and Unicorn will perform the
             # default memory write operation.
-            pass
+            return True
     
 def hook_mem_read_low(uc, access, address, size, value, user_data):
     """
