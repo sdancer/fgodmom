@@ -116,7 +116,6 @@ class VGAEmulator:
 
     def __init__(self, uc_emulator):
         self.uc = uc_emulator
-        self.vram = bytearray(VGA_MEM_SIZE)
         self.screen = None
         self.current_mode = None
         self.display_width = 0
@@ -538,7 +537,8 @@ class VGAEmulator:
                 read_size = self.vram_base + VGA_MEM_SIZE - vram_page_start_addr
                 if read_size < 0: read_size = 0
 
-            vram_data = self.vram
+            
+            vram_data = self._vram_view(0, read_size)
 
             self.screen.fill((0, 0, 0)) # Clear screen
             for row in range(self.rows):
@@ -586,11 +586,15 @@ class VGAEmulator:
         self.screen.blit(scaled_surface, (0, 0))
         pygame.display.flip()
 
+    def _vram_view(self, start, length):
+        return self.uc.mem_read(self.vram_base + start, length)
+
     def render_graph(self): 
             # Read the entire graphics VRAM segment (usually 64KB at 0xA0000)
             # For 640x350x16, each plane is 28,000 bytes. All 4 fit in 112KB,
             # so bank switching is needed. We'll assume the relevant part is mapped.
-        vram_data = self.vram
+        plane_size = 32768
+        vram_data = self._vram_view(0, plane_size*4)
 
         if self.current_mode == 0x10:
             plane_size = 32768 # 32KB per plane in our model
@@ -781,13 +785,9 @@ class VGAEmulator:
 
     def reset_vga_registers(self):
             # Reset Graphics Controller registers
-            self.gc_registers = [0] * 9
-            self.gc_registers[1] = 0x0F 
-            # Common defaults for graphics modes:
-            self.gc_registers[5] = 0x00 # Default to Write Mode 0
-            # self.gc_registers[5] = 0x40 # Mode Register: 256-color mode, write mode 0
-            self.gc_registers[6] = 0x05 # Miscellaneous Register: Graphics mode, A0000-AFFFF map
-            self.gc_registers[8] = 0xFF # Bit Mask: All bits enabled
+            self.gc_registers = [0x00]*9
+            self.gc_registers[6] = 0x05    # Misc register
+            self.gc_registers[8] = 0xFF    # Bit‑mask defaults to all 1s
 
             # Reset Sequencer registers
             self.sequencer_registers = [0] * 5 
@@ -824,44 +824,40 @@ class VGAEmulator:
         else:
             print(f"DEBUG: ignoring port {port:X}")
         
-        # Other ports (CRTC 0x3D4/5, Attribute 0x3C0/1) would be handled here too.
-
     def handle_vram_write(self, address, size, value):
+        if self.is_text_mode or self.current_mode not in (0x10, 0x12):
+            return False      # ignore text/other modes
+    
+        for i in range(size):
+            b = (value >> (i*8)) & 0xFF
+            self._write_mode2_byte(address+i, b)
+        return True
+
+    def _write_mode2_byte(self, address, value):
         """
         Handles a memory write to VRAM, applying VGA hardware logic.
         This version corrects the handling of the Bit Mask in Write Mode 2.
         """
-        if self.is_text_mode or self.current_mode not in [0x10, 0x12]:
-            print("error mode")
-            return False
-
-        if size != 1:
-            print("error size")
-            return False
 
         map_mask = self.sequencer_registers[2]
         write_mode = self.gc_registers[5] & 0x03
         logical_op = (self.gc_registers[3] >> 3) & 0x03
         
-        # --- THIS IS THE KEY AREA FOR THE FIX ---
-        # Load the Bit Mask from the register into a local variable.
-        # Do NOT modify the stored register state (self.gc_registers[8]).
         final_bit_mask = self.gc_registers[8]
-        # --- END OF KEY AREA ---
         
-        vram_offset = address - self.vram_base
+        vram_offset = address #- self.vram_base
         plane_size = 32768
 
-        if not (0 <= vram_offset < plane_size):
-            print("error offset")
-            return False
+        #if not (self.vram_base <= vram_offset < self.vram_base + plane_size * 1):
+        #    print("error offset")
+        #    return False
 
         try:
             latched = [
-                self.vram[vram_offset],
-                self.vram[vram_offset + plane_size],
-                self.vram[vram_offset + 2 * plane_size],
-                self.vram[vram_offset + 3 * plane_size]
+                self.uc.mem_read(vram_offset, 1)[0],
+                self.uc.mem_read(vram_offset + plane_size, 1)[0],
+                self.uc.mem_read(vram_offset + 2 * plane_size, 1)[0],
+                self.uc.mem_read(vram_offset + 3 * plane_size, 1)[0]
             ]
             
             data_to_write = [0, 0, 0, 0]
@@ -880,11 +876,7 @@ class VGAEmulator:
                 for i in range(4):
                     data_to_write[i] = 0xFF if (set_reset_color >> i) & 1 else 0x00
                 
-                # --- THIS IS THE FIX ---
-                # In WM2, the final mask for the operation is the register's value
-                # ANDed with the CPU's value. Use the local variable.
                 final_bit_mask &= value
-                # --- END OF FIX ---
 
             else:
                 return False
@@ -899,10 +891,10 @@ class VGAEmulator:
                 # Use the calculated final_bit_mask for this single operation
                 final_planes[i] = (latched[i] & ~final_bit_mask) | (plane_data & final_bit_mask)
 
-            if map_mask & 0x01: self.vram[vram_offset] = final_planes[0]
-            if map_mask & 0x02: self.vram[vram_offset + plane_size] = final_planes[1]
-            if map_mask & 0x04: self.vram[vram_offset + 2 * plane_size] = final_planes[2]
-            if map_mask & 0x08: self.vram[vram_offset + 3 * plane_size] = final_planes[3]
+            if map_mask & 0x01: self.uc.mem_write(vram_offset + 0 * plane_size, bytes([final_planes[0]])) 
+            if map_mask & 0x02: self.uc.mem_write(vram_offset + 1 * plane_size, bytes([final_planes[1]]))
+            if map_mask & 0x04: self.uc.mem_write(vram_offset + 2 * plane_size, bytes([final_planes[2]]))
+            if map_mask & 0x08: self.uc.mem_write(vram_offset + 3 * plane_size, bytes([final_planes[3]]))
 
         except (UcError, IndexError) as e:
             print(f"ERROR in planar VRAM write logic at {hex(address)}: {e}")
@@ -1014,333 +1006,312 @@ def handle_int10_11_30(uc: Uc):
     uc.reg_write(UC_X86_REG_CX, cx_val)
     uc.reg_write(UC_X86_REG_DL, dl_val)
 
-def handle_int10(uc, vga_emulator):
-    """Handles INT 10h (Video Services) calls."""
-    ah = uc.reg_read(UC_X86_REG_AH)
+def _handle_int10_ah00_set_mode(uc, vga_emulator):
+    """Handles INT 10h, AH=00h: Set Video Mode."""
     al = uc.reg_read(UC_X86_REG_AL)
+    vga_emulator.set_mode(al)
+    uc.mem_write(BIOS_DATA_AREA + 0x49, struct.pack("<B", al))
+    uc.reg_write(UC_X86_REG_AL, 0x00) # Often returns 0 on success
+    return True
+
+def _handle_int10_ah01_set_cursor_type(uc, vga_emulator):
+    """Handles INT 10h, AH=01h: Set Cursor Type."""
+    ch = uc.reg_read(UC_X86_REG_CH)
+    cl = uc.reg_read(UC_X86_REG_CL)
+    vga_emulator.set_cursor_shape(ch, cl)
+    return True
+
+def _handle_int10_ah02_set_cursor_pos(uc, vga_emulator):
+    """Handles INT 10h, AH=02h: Set Cursor Position."""
+    bh = uc.reg_read(UC_X86_REG_BH) # Page number
+    dh = uc.reg_read(UC_X86_REG_DH) # Row
+    dl = uc.reg_read(UC_X86_REG_DL) # Column
+    vga_emulator.set_cursor_position(dh, dl, bh)
+    return True
+
+def _handle_int10_ah03_get_cursor_pos(uc, vga_emulator):
+    """Handles INT 10h, AH=03h: Get Cursor Position and Type."""
+    current_row, current_col, start_line, end_line = vga_emulator.get_cursor_position()
+    uc.reg_write(UC_X86_REG_DH, current_row)
+    uc.reg_write(UC_X86_REG_DL, current_col)
+    uc.reg_write(UC_X86_REG_CH, start_line)
+    uc.reg_write(UC_X86_REG_CL, end_line)
+    print(f"    Returned DH={current_row}, DL={current_col}, CH={start_line}, CL={end_line}")
+    return True
+
+def _handle_int10_ah05_select_page(uc, vga_emulator):
+    """Handles INT 10h, AH=05h: Select Active Video Page."""
+    al = uc.reg_read(UC_X86_REG_AL)
+    vga_emulator.active_page = al
+    print(f"    Selected active page: {al}")
+    return True
+
+def _handle_int10_ah06_scroll_up(uc, vga_emulator):
+    """Handles INT 10h, AH=06h: Scroll Up Window."""
+    al, bh, ch, cl, dh, dl = map(uc.reg_read, [UC_X86_REG_AL, UC_X86_REG_BH, UC_X86_REG_CH, UC_X86_REG_CL, UC_X86_REG_DH, UC_X86_REG_DL])
+    print(f"    Scroll up: {al} lines, attr {hex(bh)}, window ({ch},{cl}) to ({dh},{dl})")
+    vga_emulator._scroll_window(al, ch, cl, dh, dl, bh, "up")
+    return True
+
+def _handle_int10_ah07_scroll_down(uc, vga_emulator):
+    """Handles INT 10h, AH=07h: Scroll Down Window."""
+    al, bh, ch, cl, dh, dl = map(uc.reg_read, [UC_X86_REG_AL, UC_X86_REG_BH, UC_X86_REG_CH, UC_X86_REG_CL, UC_X86_REG_DH, UC_X86_REG_DL])
+    print(f"    Scroll down: {al} lines, attr {hex(bh)}, window ({ch},{cl}) to ({dh},{dl})")
+    vga_emulator._scroll_window(al, ch, cl, dh, dl, bh, "down")
+    return True
+
+def _handle_int10_ah08_read_char_attr(uc, vga_emulator):
+    """Handles INT 10h, AH=08h: Read Character and Attribute at Cursor."""
+    bh = uc.reg_read(UC_X86_REG_BH)
+    char_code, attribute = vga_emulator.read_char_and_attribute(vga_emulator.cursor_row, vga_emulator.cursor_col, bh)
+    uc.reg_write(UC_X86_REG_AL, char_code)
+    uc.reg_write(UC_X86_REG_AH, attribute)
+    print(f"    Read char: {hex(char_code)}, attr: {hex(attribute)}")
+    return True
+
+def _handle_int10_ah09_write_char_attr(uc, vga_emulator):
+    """Handles INT 10h, AH=09h: Write Character and Attribute at Cursor."""
+    al, bh, bl, cx = map(uc.reg_read, [UC_X86_REG_AL, UC_X86_REG_BH, UC_X86_REG_BL, UC_X86_REG_CX])
+    vga_emulator.write_char_and_attribute(al, bl, vga_emulator.cursor_row, vga_emulator.cursor_col, bh, cx)
+    print(f"    Write char: '{chr(al)}' (x{cx}), attr {hex(bl)}")
+    return True
+
+def _handle_int10_ah0A_write_char(uc, vga_emulator):
+    """Handles INT 10h, AH=0Ah: Write Character Only at Cursor."""
+    al, bh, cx = map(uc.reg_read, [UC_X86_REG_AL, UC_X86_REG_BH, UC_X86_REG_CX])
+    vga_emulator.write_char_and_attribute(al, 0x07, vga_emulator.cursor_row, vga_emulator.cursor_col, bh, cx)
+    print(f"    Write char only: '{chr(al)}' (x{cx})")
+    return True
+
+def _handle_int10_ah0C_write_pixel(uc, vga_emulator):
+    """Handles INT 10h, AH=0Ch: Write Pixel."""
+    al, cx, dx = map(uc.reg_read, [UC_X86_REG_AL, UC_X86_REG_CX, UC_X86_REG_DX])
+    vga_emulator.write_pixel(cx, dx, al)
+    print(f"    Set pixel at ({cx},{dx}) to color {hex(al)}")
+    return True
+
+def _handle_int10_ah0D_read_pixel(uc, vga_emulator):
+    """Handles INT 10h, AH=0Dh: Read Pixel."""
+    cx, dx = map(uc.reg_read, [UC_X86_REG_CX, UC_X86_REG_DX])
+    color = vga_emulator.read_pixel(cx, dx)
+    uc.reg_write(UC_X86_REG_AL, color)
+    print(f"    Get pixel at ({cx},{dx}): color {hex(color)}")
+    return True
+
+def _handle_int10_ah0E_teletype(uc, vga_emulator):
+    """Handles INT 10h, AH=0Eh: Teletype Output."""
+    al = uc.reg_read(UC_X86_REG_AL)
+    vga_emulator.write_char_teletype(al)
+    print(f"    Teletype output: '{chr(al)}'")
+    return True
+
+def _handle_int10_ah0F_get_mode(uc, vga_emulator):
+    """Handles INT 10h, AH=0Fh: Get Current Video Mode."""
+    mode_bda = uc.mem_read(BIOS_DATA_AREA + 0x49, 1)[0]
+    uc.reg_write(UC_X86_REG_AL, mode_bda if mode_bda != 0 else vga_emulator.current_mode)
+    uc.reg_write(UC_X86_REG_AH, vga_emulator.chars_per_row if vga_emulator.is_text_mode else 0)
+    uc.reg_write(UC_X86_REG_BH, vga_emulator.active_page)
+    print(f"    Returning AL={uc.reg_read(UC_X86_REG_AL):02X}, AH={uc.reg_read(UC_X86_REG_AH):02X}, BH={uc.reg_read(UC_X86_REG_BH):02X}")
+    return True
+
+def _handle_int10_ah10_palette(uc, vga_emulator):
+    """Handles INT 10h, AH=10h: Palette Functions."""
+    al = uc.reg_read(UC_X86_REG_AL)
+    
+    if al == 0x00: # Set Individual Palette Register
+        bl, bh = map(uc.reg_read, [UC_X86_REG_BL, UC_X86_REG_BH])
+        new_color_rgb = vga_emulator._decode_ega_palette_color(bh)
+        vga_emulator.palette_16_color[bl] = new_color_rgb
+        print(f"    Set Palette Register {bl} to value {hex(bh)} -> RGB{new_color_rgb}")
+        return True
+        
+    elif al == 0x01: # Set Border Color
+        bl = uc.reg_read(UC_X86_REG_BL)
+        print(f"    Set Border Color to {bl}. (Not visually implemented)")
+        return True
+
+    elif al == 0x02: # Set All Palette Registers
+        es, dx = map(uc.reg_read, [UC_X86_REG_ES, UC_X86_REG_DX])
+        addr = es * 16 + dx
+        print(f"    Set All Palette Registers from {hex(addr)}.")
+        palette_bytes = uc.mem_read(addr, 16)
+        for i, val in enumerate(palette_bytes):
+            vga_emulator.palette_16_color[i] = vga_emulator._decode_ega_palette_color(val)
+        #vga_emulator.palette_16_color = VGA_PALETTE_16_COLORS
+        print("      Palette updated successfully.")
+        return True
+    
+    elif al == 0x09: # Get All 16 Palette Registers
+        es, dx = map(uc.reg_read, [UC_X86_REG_ES, UC_X86_REG_DX])
+        addr = es * 16 + dx
+        print(f"    Get All Palette Registers to buffer {hex(addr)}.")
+        palette_bytes = bytes([vga_emulator._encode_ega_palette_color(c) for c in vga_emulator.palette_16_color])
+        uc.mem_write(addr, palette_bytes)
+        print("      Successfully wrote encoded palette to buffer.")
+        return True
+
+    elif al == 0x10: # Set Individual DAC Register
+        bx, ch, cl, dh = map(uc.reg_read, [UC_X86_REG_BX, UC_X86_REG_CH, UC_X86_REG_CL, UC_X86_REG_DH])
+        r, g, b = dh * 4, ch * 4, cl * 4
+        if bx < len(VGA_PALETTE_256_COLORS):
+            VGA_PALETTE_256_COLORS[bx] = (r, g, b)
+            print(f"    Set DAC Register {bx} to RGB({r},{g},{b}).")
+        else:
+            print(f"    DAC Register {bx} out of bounds.")
+        return True
+    
+    print(f"    Unhandled INT 10h, AH=10h sub-function AL={al:02X}")
+    return False
+
+def _handle_int10_ah11_char_gen(uc, vga_emulator):
+    """Handles INT 10h, AH=11h: Character Generator Functions."""
+    al = uc.reg_read(UC_X86_REG_AL)
+    if al == 0x30:
+        handle_int10_11_30(uc)
+        return True
+    print(f"    Unhandled INT 10h, AH=11h sub-function AL={al:02X}")
+    return False
+
+def _handle_int10_ah12_vga_info(uc, vga_emulator):
+    """Handles INT 10h, AH=12h: EGA/VGA Specific Functions."""
+    bl = uc.reg_read(UC_X86_REG_BL)
+    if bl == 0x10: # Get EGA/VGA Information
+        print("    INT 10h, AH=12h, BL=10h (Get EGA/VGA Information).")
+        uc.reg_write(UC_X86_REG_BH, 0x00) # Color display
+        uc.reg_write(UC_X86_REG_BL, 0x00) # 64KB video memory
+        uc.reg_write(UC_X86_REG_CH, 0x00)
+        uc.reg_write(UC_X86_REG_CL, 0x00)
+        return True
+    print(f"    Unhandled INT 10h, AH=12h sub-function BL={bl:02X}")
+    return False
+
+def _handle_int10_ah13_write_string(uc, vga_emulator):
+    """Handles INT 10h, AH=13h: Write String."""
+    al, bh, bl, cx, dh, dl, es, bp = map(uc.reg_read, [
+        UC_X86_REG_AL, UC_X86_REG_BH, UC_X86_REG_BL, UC_X86_REG_CX, 
+        UC_X86_REG_DH, UC_X86_REG_DL, UC_X86_REG_ES, UC_X86_REG_BP
+    ])
+
+    addr = es * 16 + bp
+    bytes_per_char = 2 if (al & 0x02) else 1
+    string_bytes = uc.mem_read(addr, cx * bytes_per_char)
+    
+    print(f"    Write string: mode {bin(al)}, page {bh}, attr {hex(bl)}, len {cx}, pos ({dh},{dl})")
+    
+    row, col = dh, dl
+    str_idx = 0
+    for _ in range(cx):
+        char_code = string_bytes[str_idx]
+        char_attr = string_bytes[str_idx + 1] if (al & 0x02) else bl
+        
+        vga_emulator.write_char_and_attribute(char_code, char_attr, row, col, bh, 1)
+        
+        str_idx += bytes_per_char
+        col += 1
+        if col >= vga_emulator.chars_per_row:
+            col = 0
+            row += 1
+
+    if (al & 0x01): # Update cursor
+        vga_emulator.set_cursor_position(row, col, bh)
+    return True
+
+def _handle_int10_ah1A_display_code(uc, vga_emulator):
+    """Handles INT 10h, AH=1Ah: Read/Write Display Combination Code."""
+    al = uc.reg_read(UC_X86_REG_AL)
+    if al == 0x00:
+        uc.reg_write(UC_X86_REG_AL, 0x1A) # Function supported
+        uc.reg_write(UC_X86_REG_BH, 0x00) # Analog display (VGA/MCGA)
+        uc.reg_write(UC_X86_REG_BL, 0x08) # Color mode
+        print("    Get Display Combination Code: AL=1A, BH=00, BL=08 (VGA/MCGA Color).")
+        return True
+    print(f"    Unhandled INT 10h, AH=1Ah sub-function AL={al:02X}")
+    return False
+
+def _handle_int10_ah1C_video_state(uc, vga_emulator):
+    """Handles INT 10h, AH=1Ch: Save/Restore Video State."""
+    al = uc.reg_read(UC_X86_REG_AL)
+    cx = uc.reg_read(UC_X86_REG_CX)
+
+    if al == 0x00: # Get State Buffer Size
+        print(f"    INT 10h, AH=1Ch, AL=00h (Get Buffer Size) for mask CX={cx:04X}.")
+        buffer_size_in_blocks = 16
+        uc.reg_write(UC_X86_REG_AL, 0x1C)
+        uc.reg_write(UC_X86_REG_BX, buffer_size_in_blocks)
+        print(f"    Returning buffer size of {buffer_size_in_blocks * 64} bytes.")
+        return True
+    
+    elif al in [0x01, 0x02]: # Save or Restore State
+        es, bx = map(uc.reg_read, [UC_X86_REG_ES, UC_X86_REG_BX])
+        addr = es * 16 + bx
+        action = "Save" if al == 0x01 else "Restore"
+        print(f"    INT 10h, AH=1Ch, AL={al:02h} ({action} State) to/from {es:04X}:{bx:04X}.")
+        
+        # Acknowledge the call without actually doing the complex state transfer
+        uc.reg_write(UC_X86_REG_AL, 0x1C) # Success
+        print(f"    Successfully acknowledged state {action.lower()}.")
+        return True
+
+    print(f"    Unhandled INT 10h, AH=1Ch sub-function AL={al:02X}")
+    return False
+
+
+# --- Main Dispatcher Function ---
+
+def handle_int10(uc, vga_emulator):
+    """Handles INT 10h (Video Services) calls by dispatching to sub-handlers."""
+    ah = uc.reg_read(UC_X86_REG_AH)
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
-    print(f"[*] INT 10h, AH={ah:02X} AL={al:02X} {current_cs:X}:{current_ip:X} ")
+    print(f"[*] INT 10h, AH={ah:02X} at {current_cs:X}:{current_ip:X}")
 
-    if ah == 0x00: # Set Video Mode
-        al = uc.reg_read(UC_X86_REG_AL)
-        vga_emulator.set_mode(al)
-        # Update BIOS Data Area (BDA) at 0x40:0x49 for active video mode
-        # This is where BIOS usually stores the current video mode.
-        uc.mem_write(BIOS_DATA_AREA + 0x49, struct.pack("<B", al))
-        uc.reg_write(UC_X86_REG_AL, 0x00) # Often returns 0 on success
-        
-    elif ah == 0x01: # Set Cursor Type
-        ch = uc.reg_read(UC_X86_REG_CH)
-        cl = uc.reg_read(UC_X86_REG_CL)
-        vga_emulator.set_cursor_shape(ch, cl)
+    ah_handlers = {
+        0x00: _handle_int10_ah00_set_mode,
+        0x01: _handle_int10_ah01_set_cursor_type,
+        0x02: _handle_int10_ah02_set_cursor_pos,
+        0x03: _handle_int10_ah03_get_cursor_pos,
+        0x05: _handle_int10_ah05_select_page,
+        0x06: _handle_int10_ah06_scroll_up,
+        0x07: _handle_int10_ah07_scroll_down,
+        0x08: _handle_int10_ah08_read_char_attr,
+        0x09: _handle_int10_ah09_write_char_attr,
+        0x0A: _handle_int10_ah0A_write_char,
+        0x0C: _handle_int10_ah0C_write_pixel,
+        0x0D: _handle_int10_ah0D_read_pixel,
+        0x0E: _handle_int10_ah0E_teletype,
+        0x0F: _handle_int10_ah0F_get_mode,
+        0x10: _handle_int10_ah10_palette,
+        0x11: _handle_int10_ah11_char_gen,
+        0x12: _handle_int10_ah12_vga_info,
+        0x13: _handle_int10_ah13_write_string,
+        0x1A: _handle_int10_ah1A_display_code,
+        0x1C: _handle_int10_ah1C_video_state,
+    }
 
-    elif ah == 0x02: # Set Cursor Position
-        bh = uc.reg_read(UC_X86_REG_BH) # Page number
-        dh = uc.reg_read(UC_X86_REG_DH) # Row
-        dl = uc.reg_read(UC_X86_REG_DL) # Column
-        vga_emulator.set_cursor_position(dh, dl, bh)
+    handler = ah_handlers.get(ah)
+    handled = False
 
-    elif ah == 0x03: # Get Cursor Position and Type
-        # BH (page number) is input, DH, DL, CH, CL are outputs
-        current_row, current_col, start_line, end_line = vga_emulator.get_cursor_position()
-        uc.reg_write(UC_X86_REG_DH, current_row)
-        uc.reg_write(UC_X86_REG_DL, current_col)
-        uc.reg_write(UC_X86_REG_CH, start_line)
-        uc.reg_write(UC_X86_REG_CL, end_line)
-        # BH (active page) is typically not written back, but could be.
-        # It's an input register, here, so no need to write.
-        print(f"    Returned DH={current_row}, DL={current_col}, CH={start_line}, CL={end_line}")
+    if handler:
+        try:
+            # Call the specific handler function
+            handled = handler(uc, vga_emulator)
+        except UcError as e:
+            print(f"    ERROR executing handler for AH={ah:02X}: {e}")
+            # Mark as unhandled to stop emulation
+            handled = False
+        except Exception as e:
+            print(f"    UNEXPECTED PYTHON ERROR in handler for AH={ah:02X}: {e}")
+            handled = False
 
-    elif ah == 0x05: # Select Active Video Page
-        al = uc.reg_read(UC_X86_REG_AL)
-        vga_emulator.active_page = al
-        print(f"    Selected active page: {al}")
-
-    elif ah == 0x06: # Scroll Up Window
-        al = uc.reg_read(UC_X86_REG_AL) # Number of lines to scroll (00h = clear)
-        bh = uc.reg_read(UC_X86_REG_BH) # Attribute for blank lines
-        ch = uc.reg_read(UC_X86_REG_CH) # Row UL
-        cl = uc.reg_read(UC_X86_REG_CL) # Col UL
-        dh = uc.reg_read(UC_X86_REG_DH) # Row LR
-        dl = uc.reg_read(UC_X86_REG_DL) # Col LR
-        print(f"    Scroll up: {al} lines, attr {hex(bh)}, window ({ch},{cl}) to ({dh},{dl})")
-        vga_emulator._scroll_window(al, ch, cl, dh, dl, bh, "up")
-
-    elif ah == 0x07: # Scroll Down Window
-        al = uc.reg_read(UC_X86_REG_AL) # Number of lines to scroll (00h = clear)
-        bh = uc.reg_read(UC_X86_REG_BH) # Attribute for blank lines
-        ch = uc.reg_read(UC_X86_REG_CH) # Row UL
-        cl = uc.reg_read(UC_X86_REG_CL) # Col UL
-        dh = uc.reg_read(UC_X86_REG_DH) # Row LR
-        dl = uc.reg_read(UC_X86_REG_DL) # Col LR
-        print(f"    Scroll down: {al} lines, attr {hex(bh)}, window ({ch},{cl}) to ({dh},{dl})")
-        vga_emulator._scroll_window(al, ch, cl, dh, dl, bh, "down")
-
-    elif ah == 0x08: # Read Character and Attribute at Cursor Position
-        bh = uc.reg_read(UC_X86_REG_BH) # Page number
-        char_code, attribute = vga_emulator.read_char_and_attribute(vga_emulator.cursor_row, vga_emulator.cursor_col, bh)
-        uc.reg_write(UC_X86_REG_AL, char_code)
-        uc.reg_write(UC_X86_REG_AH, attribute)
-        print(f"    Read char: {hex(char_code)}, attr: {hex(attribute)}")
-
-    elif ah == 0x09: # Write Character and Attribute at Cursor Position
-        al = uc.reg_read(UC_X86_REG_AL) # Character to display
-        bh = uc.reg_read(UC_X86_REG_BH) # Page number
-        bl = uc.reg_read(UC_X86_REG_BL) # Attribute
-        cx = uc.reg_read(UC_X86_REG_CX) # Number of times to write
-        vga_emulator.write_char_and_attribute(al, bl, vga_emulator.cursor_row, vga_emulator.cursor_col, bh, cx)
-        print(f"    Write char: '{chr(al)}' (x{cx}), attr {hex(bl)}")
-
-    elif ah == 0x0A: # Write Character Only at Cursor Position
-        al = uc.reg_read(UC_X86_REG_AL) # Character to display
-        bh = uc.reg_read(UC_X86_REG_BH) # Page number
-        cx = uc.reg_read(UC_X86_REG_CX) # Number of times to write
-        # Default attribute (light gray on black) or read current attribute for the cell?
-        # Typically, this function uses the attribute already at the location, or a default.
-        # For simplicity, using a default attribute.
-        vga_emulator.write_char_and_attribute(al, 0x07, vga_emulator.cursor_row, vga_emulator.cursor_col, bh, cx)
-        print(f"    Write char only: '{chr(al)}' (x{cx})")
-
-    elif ah == 0x0C: # Change color for a single pixel (graphics mode)
-        al = uc.reg_read(UC_X86_REG_AL) # Pixel color
-        cx = uc.reg_read(UC_X86_REG_CX) # Column (X)
-        dx = uc.reg_read(UC_X86_REG_DX) # Row (Y)
-        vga_emulator.write_pixel(cx, dx, al)
-        print(f"    Set pixel at ({cx},{dx}) to color {hex(al)}")
-
-    elif ah == 0x0D: # Get color of a single pixel (graphics mode)
-        cx = uc.reg_read(UC_X86_REG_CX) # Column (X)
-        dx = uc.reg_read(UC_X86_REG_DX) # Row (Y)
-        color = vga_emulator.read_pixel(cx, dx)
-        uc.reg_write(UC_X86_REG_AL, color)
-        print(f"    Get pixel at ({cx},{dx}): color {hex(color)}")
-
-    elif ah == 0x0E: # Teletype output
-        al = uc.reg_read(UC_X86_REG_AL) # Character to write
-        # BL (foreground color) can be an input here, but often ignored for simplicity.
-        # Use default attribute or the one for the current active page.
-        vga_emulator.write_char_teletype(al)
-        print(f"    Teletype output: '{chr(al)}'")
-
-    elif ah == 0x0F: # Get Current Video Mode
-        # AL = mode, AH = columns, BH = active display page
-        # In a real BIOS, this would read from BDA (0x40:0x49 for mode)
-        current_mode_bda = vga_emulator.uc.mem_read(BIOS_DATA_AREA + 0x49, 1)[0] # Read from BDA
-        uc.reg_write(UC_X86_REG_AL, current_mode_bda if current_mode_bda != 0 else vga_emulator.current_mode)
-        uc.reg_write(UC_X86_REG_AH, vga_emulator.chars_per_row if vga_emulator.is_text_mode else 0) # Columns
-        uc.reg_write(UC_X86_REG_BH, vga_emulator.active_page) # Display page
-        print(f"    Returning AL={uc.reg_read(UC_X86_REG_AL):02X}, AH={uc.reg_read(UC_X86_REG_AH):02X}, BH={uc.reg_read(UC_X86_REG_BH):02X}")
-
-    elif ah == 0x13: # Write string
-        al = uc.reg_read(UC_X86_REG_AL) # Write mode (bit 0: update cursor, bit 1: string contains attributes)
-        bh = uc.reg_read(UC_X86_REG_BH) # Page number
-        bl = uc.reg_read(UC_X86_REG_BL) # Attribute (if bit 1 of AL is zero)
-        cx = uc.reg_read(UC_X86_REG_CX) # Number of characters in string
-        dl = uc.reg_read(UC_X86_REG_DL) # Column
-        dh = uc.reg_read(UC_X86_REG_DH) # Row
-        es = uc.reg_read(UC_X86_REG_ES)
-        bp = uc.reg_read(UC_X86_REG_BP)
-        
-        start_addr = es * 16 + bp
-        string_bytes = uc.mem_read(start_addr, cx * (2 if (al & 0x02) else 1)) # Read string bytes
-        
-        current_row, current_col = dh, dl
-        
-        print(f"    Write string: mode {bin(al)}, page {bh}, attr {hex(bl)}, len {cx}, pos ({dh},{dl})")
-
-        str_idx = 0
-        for i in range(cx):
-            char_code = string_bytes[str_idx]
-            char_attr = bl # Default attribute
-            if (al & 0x02): # String contains attributes
-                str_idx += 1
-                char_attr = string_bytes[str_idx]
-            
-            vga_emulator.write_char_and_attribute(char_code, char_attr, current_row, current_col, bh, 1)
-            
-            str_idx += 1
-            current_col += 1
-            if current_col >= vga_emulator.chars_per_row:
-                current_col = 0
-                current_row += 1
-
-        if (al & 0x01): # Update cursor after writing
-            vga_emulator.set_cursor_position(current_row, current_col, bh)
-
-    elif ah == 0x11: # Character Generator Functions (Load Fonts)
-        al = uc.reg_read(UC_X86_REG_AL)
-        
-        if al == 0x30: # Load 8x8 font (double dot)
-            handle_int10_11_30(uc)
-
-    elif ah == 0x12: # EGA/VGA - specific functions
-        bl = uc.reg_read(UC_X86_REG_BL)
-        if bl == 0x10: # Get EGA/VGA Information
-            print(f"    INT 10h, AH=12h, BL=10h (Get EGA/VGA Information).")
-            # Return values:
-            # BH = 0 (color), BL = 0 (64KB), CH = 0 (switch active disp), CL = 0 (switch inactive disp)
-            # DX = 0 (monitor type)
-            uc.reg_write(UC_X86_REG_BH, 0x00) # Color display
-            uc.reg_write(UC_X86_REG_BL, 0x00) # 64KB video memory (common for basic VGA)
-            uc.reg_write(UC_X86_REG_CH, 0x00) # Switch active display
-            uc.reg_write(UC_X86_REG_CL, 0x00) # Switch inactive display
-            uc.reg_write(UC_X86_REG_DX, 0x01) # Monitor type (0=mono, 1=color) - often ignored by games.
-        elif bl == 0x20: # Select default palette loading (VGA)
-            print(f"    INT 10h, AH=12h, BL=20h (Select default palette loading). Acknowledged.")
-            # No return values.
-        else:
-            print(f"    Unhandled INT 10h function: AH={ah:02X}, BL={bl:02X}. Stopping emulation.")
-            uc.emu_stop()
-    elif ah == 0x1A: # Read/Write Display Combination Code
-        al = uc.reg_read(UC_X86_REG_AL)
-        if al == 0x00: # Get display combination code
-            uc.reg_write(UC_X86_REG_AL, 0x1A) # Function supported
-            uc.reg_write(UC_X86_REG_BH, 0x00) # Analog display (VGA/MCGA)
-            uc.reg_write(UC_X86_REG_BL, 0x08) # Color mode
-            print(f"    Get Display Combination Code: AL=1A, BH=00, BL=08 (VGA/MCGA Color).")
-        else:
-             print(f"    Unhandled INT 10h, AH=1A, AL={al:02X}. Stopping emulation.")
-             uc.emu_stop()
-
-    elif ah == 0x10: # Palette/Color Register Functions
-        al = uc.reg_read(UC_X86_REG_AL)
-        if al == 0x00: # Set Individual Palette Register (EGA/VGA 16-color modes)
-            bl = uc.reg_read(UC_X86_REG_BL) # Palette register index (0-15)
-            bh = uc.reg_read(UC_X86_REG_BH) # Color value (6-bit EGA format)
-            
-            if 0 <= bl < 16:
-                new_color_rgb = vga_emulator._decode_ega_palette_color(bh)
-                vga_emulator.palette_16_color[bl] = new_color_rgb
-                print(f"    Set Palette Register {bl} to value {hex(bh)} -> RGB{new_color_rgb}")
-            else:
-                print(f"    Warning: Invalid palette register index {bl}")
-        elif al == 0x01: # Set Border Color
-            bl = uc.reg_read(UC_X86_REG_BL) # Border color index
-            print(f"    Set Border Color to {bl}. (Not visually implemented)")
-
-        elif al == 0x02: # Set All Palette Registers (EGA/VGA 16-color modes)
-            dx = uc.reg_read(UC_X86_REG_DX)
-            es = uc.reg_read(UC_X86_REG_ES)
-            palette_data_addr = es * 16 + dx
-            print(f"    Set All Palette Registers from {hex(palette_data_addr)}.")
-            
-            try:
-                palette_bytes = uc.mem_read(palette_data_addr, 16)
-                print("palette bytes:", palette_bytes)
-                for i in range(16):
-                    new_color_rgb = vga_emulator._decode_ega_palette_color(palette_bytes[i])
-                    vga_emulator.palette_16_color[i] = new_color_rgb
-                vga_emulator.palette_16_color = VGA_PALETTE_16_COLORS
-                print(vga_emulator.palette_16_color)
-                print(f"      Palette updated successfully.")
-            except UcError as e:
-                print(f"      ERROR reading palette data: {e}")
-        elif al == 0x03: # Toggle Intensity/Blinking
-            bl = uc.reg_read(UC_X86_REG_BL) # 0=enable intensive, 1=enable blinking
-            print(f"    Toggle Intensity/Blinking: {bl}. (Not fully implemented)")
-        elif al == 0x07: # Get Individual Palette Register
-            bl = uc.reg_read(UC_X86_REG_BL) # Palette register index (0-15)
-            if 0 <= bl < 16:
-                rgb_tuple = self.palette_16_color[bl]
-                ega_val = self._encode_ega_palette_color(rgb_tuple)
-                uc.reg_write(UC_X86_REG_BH, ega_val)
-                print(f"    Get Palette Register {bl}: returning value {hex(ega_val)}")
-            else:
-                print(f"    Warning: Invalid palette register index {bl} for read.")
-
-        elif al == 0x09: # Get All 16 Palette Registers
-            dx = uc.reg_read(UC_X86_REG_DX)
-            es = uc.reg_read(UC_X86_REG_ES)
-            buffer_addr = es * 16 + dx
-            print(f"    Get All Palette Registers to buffer {hex(buffer_addr)}.")
-            try:
-                # Create a 16-byte array with the encoded palette data
-                palette_bytes = bytearray(16)
-                for i in range(16):
-                    palette_bytes[i] = self._encode_ega_palette_color(self.palette_16_color[i])
-                
-                # Write the data to the game's buffer in emulated memory
-                uc.mem_write(buffer_addr, bytes(palette_bytes))
-                print(f"      Successfully wrote encoded palette to buffer.")
-            except UcError as e:
-                print(f"      ERROR writing palette data to buffer: {e}")
-        elif al == 0x10: # Set Individual DAC Register (256-color palette)
-            bx = uc.reg_read(UC_X86_REG_BX) # Color register index
-            dh = uc.reg_read(UC_X86_REG_DH) # Red value (0-63)
-            ch = uc.reg_read(UC_X86_REG_CH) # Green value (0-63)
-            cl = uc.reg_read(UC_X86_REG_CL) # Blue value (0-63)
-            
-            # Scale 0-63 to 0-255 for Pygame
-            r, g, b = dh * 4, ch * 4, cl * 4
-            if bx < len(VGA_PALETTE_256_COLORS):
-                VGA_PALETTE_256_COLORS[bx] = (r, g, b)
-                print(f"    Set DAC Register {bx} to RGB({r},{g},{b}).")
-            else:
-                print(f"    DAC Register {bx} out of bounds. Max {len(VGA_PALETTE_256_COLORS)-1}.")
-        # ... more INT 10h AH=10h subfunctions as needed ...
-        else:
-            print(f"    Unhandled INT 10h function: AH={ah:02X}, AL={al:02X}. Stopping emulation.")
-            uc.emu_stop()
-
-    elif ah == 0x1C: # Save/Restore Video State
-        al = uc.reg_read(UC_X86_REG_AL)
-        cx = uc.reg_read(UC_X86_REG_CX)
-        
-        if al == 0x00: # Get State Buffer Size
-            print(f"    INT 10h, AH=1Ch, AL=00h (Get Buffer Size) for state mask CX={cx:04X}.")
-            # A full save (CX=0007h) on a real VGA BIOS takes about 1024 bytes.
-            # 1024 bytes / 64 bytes-per-block = 16 blocks.
-            # We will return this as a reasonable, fixed value for simplicity.
-            # A more complex emulator would calculate this based on the CX bits.
-            buffer_size_in_blocks = 16 
-            uc.reg_write(UC_X86_REG_AL, 0x1C) # Confirm function support
-            uc.reg_write(UC_X86_REG_BX, buffer_size_in_blocks)
-            print(f"    Returning buffer size of {buffer_size_in_blocks} blocks ({buffer_size_in_blocks * 64} bytes).")
-
-        elif al == 0x01: # Save Video State
-            es = uc.reg_read(UC_X86_REG_ES)
-            bx = uc.reg_read(UC_X86_REG_BX)
-            buffer_addr = es * 16 + bx
-            print(f"    INT 10h, AH=1Ch, AL=01h (Save State) to {es:04X}:{bx:04X} (mask CX={cx:04X}).")
-            # In a real implementation, we would collect all the state data
-            # (VGA registers, BDA state, palette) and write it to the buffer.
-            # For now, we simulate this by acknowledging the call and writing a placeholder.
-            # We'll write a small, recognizable pattern to the buffer.
-            placeholder_data = b'\x53\x56\x53\x54' # "SVST" for "SaVe STate"
-            try:
-                uc.mem_write(buffer_addr, placeholder_data)
-                uc.reg_write(UC_X86_REG_AL, 0x1C) # Success
-                print(f"    Successfully acknowledged state save.")
-            except UcError as e:
-                print(f"    ERROR saving video state to {hex(buffer_addr)}: {e}")
-                # A real BIOS might set CF on error, but stopping is fine for debug.
-                uc.emu_stop()
-
-        elif al == 0x02: # Restore Video State
-            es = uc.reg_read(UC_X86_REG_ES)
-            bx = uc.reg_read(UC_X86_REG_BX)
-            buffer_addr = es * 16 + bx
-            print(f"    INT 10h, AH=1Ch, AL=02h (Restore State) from {es:04X}:{bx:04X} (mask CX={cx:04X}).")
-            # A full implementation would read the state from the buffer and apply it
-            # by calling vga_emulator.set_mode(), restoring palette, cursor, etc.
-            # For now, we just acknowledge that the call was made.
-            uc.reg_write(UC_X86_REG_AL, 0x1C) # Success
-            print(f"    Successfully acknowledged state restore. (State not actually changed).")
-        
-        else:
-            print(f"    Unhandled INT 10h, AH=1Ch with unknown AL={al:02X}. Stopping emulation.")
-            uc.emu_stop()
+    if handled:
+        # Most INT 10h functions clear the Carry Flag on success.
+        eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+        eflags &= ~0x0001  # Clear Carry Flag (CF)
+        uc.reg_write(UC_X86_REG_EFLAGS, eflags)
     else:
-        print(f"    Unhandled INT 10h function: AH={ah:02X}. Stopping emulation.") # Use :02X for hex print
+        # If the handler was not found, or it returned False (unhandled sub-function)
+        print(f"    Unhandled INT 10h function: AH={ah:02X}. Stopping emulation.")
         uc.emu_stop()
-
-    # Ensure Carry Flag is cleared for success, set for error (if not already handled)
-    # Most INT 10h functions clear CF on success.
-    eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-    eflags &= ~0x0001 # Clear Carry Flag (CF)
-    uc.reg_write(UC_X86_REG_EFLAGS, eflags)
-
 
 def handle_int16(uc, vga_emulator):
     """Handles INT 16h (Keyboard Services) calls."""
