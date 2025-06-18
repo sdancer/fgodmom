@@ -112,7 +112,8 @@ def handle_int21(uc, vga_emulator):
     ah = uc.reg_read(UC_X86_REG_AH)
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
-    print(f"[*] INT 21h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
+    if ah != 0x2c:
+        print(f"[*] INT 21h, AH={hex(ah)} {current_cs:X}:{current_ip:X} ")
 
     if ah == 0x01: # Read character from standard input, with echo
         key_data = vga_emulator.pop_key_from_bios_buffer()
@@ -272,12 +273,30 @@ def handle_int21(uc, vga_emulator):
         print(f"    Get system date: 2000-01-01 (Sat)")
 
     elif ah == 0x2C: # Get system time
-        # Return dummy time (e.g., 10:30:00.00)
-        uc.reg_write(UC_X86_REG_CH, 10) # Hour
-        uc.reg_write(UC_X86_REG_CL, 30) # Minute
-        uc.reg_write(UC_X86_REG_DH, 0)  # Second
-        uc.reg_write(UC_X86_REG_DL, 0)  # 1/100 seconds
-        print(f"    Get system time: 10:30:00.00")
+        # Get the current local time from the system
+        now = time.localtime()
+        
+        # time.time() returns a float like 1678886461.123
+        # The fractional part (% 1) gives us the hundredths of a second
+        hundredths = int((time.time() % 1) * 100)
+        
+        # Extract components for clarity
+        hour = now.tm_hour
+        minute = now.tm_min
+        second = now.tm_sec
+        
+        # Write values to the registers as per the DOS API specification:
+        # CH = Hour (0-23)
+        # CL = Minute (0-59)
+        # DH = Second (0-59)
+        # DL = Hundredths of a second (0-99)
+        uc.reg_write(UC_X86_REG_CH, hour)
+        uc.reg_write(UC_X86_REG_CL, minute)
+        uc.reg_write(UC_X86_REG_DH, second)
+        uc.reg_write(UC_X86_REG_DL, hundredths)
+        
+        # Print a helpful, dynamic debug message showing the time returned
+        # print(f"    Get system time: {hour:02d}:{minute:02d}:{second:02d}.{hundredths:02d}")
 
     elif ah == 0x35: # Get Interrupt Vector
         al = uc.reg_read(UC_X86_REG_AL)

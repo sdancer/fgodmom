@@ -24,6 +24,28 @@ mod atoms {
         mode64,
         mode_arm,
         mode_thumb,
+
+        // --- Atoms for map keys and values ---
+        // Instruction map keys
+        address,
+        mnemonic,
+        operands,
+        bytes,
+
+        // Operand map keys
+        op_type, // `type` is a Rust keyword
+        reg,    // Also used as a value
+        value,
+        base,
+        index,
+        scale,
+        disp,
+        segment, // --- ADDED: Atom for the segment register ---
+
+        // Operand type values
+        imm,
+        mem,
+        other,
     }
 }
 
@@ -32,18 +54,28 @@ fn disassemble<'a>(
     env: Env<'a>,
     code: Binary,
     arch_atom: Atom,
-    _mode_atom: Atom,
+    mode_atom: Atom, // --- CHANGED: Use the mode_atom parameter ---
     base: u64,
 ) -> NifResult<Term<'a>> {
     // 1. Convert Elixir atoms to Capstone enums
+    // --- CHANGED: Properly handle architecture and mode ---
     let cs = match arch_atom.to_term(env).atom_to_string().as_deref() {
-        Ok("x86") => Capstone::new().x86().mode(ArchMode::Mode16),
+        Ok("x86") => {
+            let mode = match mode_atom.to_term(env).atom_to_string().as_deref() {
+                Ok("mode16") => ArchMode::Mode16,
+                Ok("mode32") => ArchMode::Mode32,
+                Ok("mode64") => ArchMode::Mode64,
+                _ => return Ok((atoms::error(), "unsupported_x86_mode").encode(env)),
+            };
+            Capstone::new().x86().mode(mode)
+        }
+        // TODO: Add other architectures like arm, arm64
         _ => return Ok((atoms::error(), "unsupported_architecture").encode(env)),
     };
 
     // 2. Initialize Capstone
     let cs = cs
-        .detail(true) // We'll ask for details, though we won't use them all yet
+        .detail(true)
         .build()
         .map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
 
@@ -59,11 +91,11 @@ fn disassemble<'a>(
     for i in insns.iter() {
         let mut insn_map = rustler::types::map::map_new(env);
         insn_map = insn_map
-            .map_put("address".encode(env), i.address().encode(env))
+            .map_put(atoms::address(), i.address().encode(env))
             .unwrap();
         insn_map = insn_map
             .map_put(
-                "mnemonic".encode(env),
+                atoms::mnemonic(),
                 i.mnemonic().unwrap_or("").encode(env),
             )
             .unwrap();
@@ -71,65 +103,62 @@ fn disassemble<'a>(
         // 5. Get instruction details and build a list of structured operands
         let mut operands_list: Vec<Term<'a>> = Vec::new();
 
-        // The detail struct is owned by the Capstone instance, not the instruction
         if let Ok(detail) = cs.insn_detail(i) {
             let arch_detail = detail.arch_detail();
             if let X86Detail(x86) = arch_detail {
-                //println!("{:?}", x86.operands());
                 for op in x86.operands() {
                     let mut op_map = rustler::types::map::map_new(env);
                     match op.op_type {
                         X86OperandType::Reg(reg) => {
-                            op_map = op_map
-                                .map_put("type".encode(env), "reg".encode(env))
-                                .unwrap();
+                            op_map = op_map.map_put(atoms::op_type(), atoms::reg()).unwrap();
                             op_map = op_map
                                 .map_put(
-                                    "reg".encode(env),
+                                    atoms::reg(),
                                     cs.reg_name(reg).unwrap_or("".to_string()).encode(env),
                                 )
                                 .unwrap();
                         }
                         X86OperandType::Imm(imm) => {
+                            op_map = op_map.map_put(atoms::op_type(), atoms::imm()).unwrap();
                             op_map = op_map
-                                .map_put("type".encode(env), "imm".encode(env))
-                                .unwrap();
-                            op_map = op_map
-                                .map_put("value".encode(env), imm.encode(env))
+                                .map_put(atoms::value(), imm.encode(env))
                                 .unwrap();
                         }
                         X86OperandType::Mem(mem) => {
-                            op_map = op_map
-                                .map_put("type".encode(env), "mem".encode(env))
-                                .unwrap();
+                            op_map = op_map.map_put(atoms::op_type(), atoms::mem()).unwrap();
+
+                            // --- ADDED: Handle segment override ---
+                            let segment_reg = mem.segment();
+                            // reg_name() returns None for invalid/default registers, which is perfect.
+                            if let Some(segment_name) = cs.reg_name(segment_reg) {
+                                op_map = op_map
+                                    .map_put(atoms::segment(), segment_name.encode(env))
+                                    .unwrap();
+                            }
+
                             if let Some(base_reg) = cs.reg_name(mem.base()) {
                                 op_map = op_map
-                                    .map_put("base".encode(env), base_reg.encode(env))
+                                    .map_put(atoms::base(), base_reg.encode(env))
                                     .unwrap();
                             }
                             if let Some(index_reg) = cs.reg_name(mem.index()) {
                                 op_map = op_map
-                                    .map_put("index".encode(env), index_reg.encode(env))
+                                    .map_put(atoms::index(), index_reg.encode(env))
                                     .unwrap();
                             }
                             if mem.scale() != 1 {
-                                // Only include scale if it's not the default
                                 op_map = op_map
-                                    .map_put("scale".encode(env), mem.scale().encode(env))
+                                    .map_put(atoms::scale(), mem.scale().encode(env))
                                     .unwrap();
                             }
                             if mem.disp() != 0 {
-                                // Only include displacement if non-zero
                                 op_map = op_map
-                                    .map_put("disp".encode(env), mem.disp().encode(env))
+                                    .map_put(atoms::disp(), mem.disp().encode(env))
                                     .unwrap();
                             }
                         }
                         _ => {
-                            // Handle other operand types like FP if necessary
-                            op_map = op_map
-                                .map_put("type".encode(env), "other".encode(env))
-                                .unwrap();
+                            op_map = op_map.map_put(atoms::op_type(), atoms::other()).unwrap();
                         }
                     }
                     operands_list.push(op_map);
@@ -137,18 +166,16 @@ fn disassemble<'a>(
             }
         }
 
-        // Add the list of operand maps to the main instruction map
-
-        println!("{:?}", operands_list);
         insn_map = insn_map
-            .map_put("operands".encode(env), operands_list.encode(env))
+            .map_put(atoms::operands(), operands_list.encode(env))
             .unwrap();
 
         let bytes_slice = i.bytes();
         let mut owned_binary = OwnedBinary::new(bytes_slice.len()).unwrap();
         owned_binary.as_mut_slice().copy_from_slice(bytes_slice);
+
         insn_map = insn_map
-            .map_put("bytes".encode(env), owned_binary.release(env).encode(env))
+            .map_put(atoms::bytes(), owned_binary.release(env).encode(env))
             .unwrap();
         result_list.push(insn_map);
     }

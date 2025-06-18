@@ -48,7 +48,44 @@ LZEXE_COMPRESSED_SIZE_PARAGRAPHS_OFFSET = 0x08
 LZEXE_ADDITIONAL_SIZE_PARAGRAPHS_OFFSET = 0x0A
 LZEXE_DECOMPRESSOR_CODE_SIZE_BYTES_OFFSET = 0x0C
 
-# --- Unicorn Hooks ---
+import time
+
+last_tick_time = time.time()
+
+TICK_FREQUENCY = 18.2065  # Hz
+TICK_INTERVAL_S = 1.0 / TICK_FREQUENCY # Seconds between ticks
+
+BDA_SEGMENT = 0x0040
+TIMER_TICK_LOW_OFFSET = 0x006C
+TIMER_TICK_ADDRESS = (BDA_SEGMENT << 4) + TIMER_TICK_LOW_OFFSET # Physical address 0x46C
+
+
+def emulate_timer_tick(uc):
+    """
+    Simulates one timer tick: reads the counter, increments it, and writes it back.
+    """
+    try:
+        # Read the current 4-byte counter value (little-endian)
+        counter_bytes = uc.mem_read(TIMER_TICK_ADDRESS, 4)
+        counter_val = int.from_bytes(counter_bytes, 'little')
+
+        # Increment the counter
+        counter_val += 1
+
+        # Write the new value back to memory
+        # print(f"[TIMER] Tick! Incrementing counter at 0x{TIMER_TICK_ADDRESS:04X} to {counter_val}")
+        uc.mem_write(TIMER_TICK_ADDRESS, counter_val.to_bytes(4, 'little'))
+        
+        # --- Advanced Emulation ---
+        # To be more complete, you would also simulate the INT 08h and INT 1Ch call chain here.
+        # For simple programs that just read the value, this is often sufficient.
+
+    except UcError as e:
+        print(f"Error in timer tick emulation: {e}")
+
+IN_OPCODES = {0xE4, 0xE5, 0xEC, 0xED}
+OUT_OPCODES = {0xE6, 0xE7, 0xEE, 0xEF}
+
 
 def hook_code(uc, address, size, user_data):
     """
@@ -61,8 +98,25 @@ def hook_code(uc, address, size, user_data):
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
     physical_address = current_cs * 16 + current_ip
-    if UNPACKED_EXE_DUMPED:
-        print(f"- {physical_address:X}")
+
+    instruction_bytes = uc.mem_read(address, size)
+    # The first byte is the primary opcode
+    opcode = instruction_bytes[0]
+
+    if opcode in IN_OPCODES:
+            print(f"[!] INSTRUCTION DETECTED: IN at address {address:X}")
+
+    elif opcode in OUT_OPCODES:
+            # We detected an OUT instruction.
+            print(f"[!] INSTRUCTION DETECTED: OUT at address {address:X}")
+
+    # wait tick, too expensive
+    if physical_address in [0x315F1, 0x315F4]:
+        pass
+    else:
+      if UNPACKED_EXE_DUMPED:
+          print(f"- {physical_address:X} {address:X}")
+        
 
     # The final JMPF instruction is at a specific offset within the decompressor's segment.
     # The user_data['final_jmp_addr'] is pre-calculated to hit this exact instruction.
@@ -102,8 +156,10 @@ def hook_interrupt(uc, intno, user_data):
     Stops emulation if an unsupported interrupt or function is encountered.
     """
     vga_emulator = user_data['vga_emulator'] # Get the VGA emulator instance
-
-    print(intno)
+    ah = uc.reg_read(UC_X86_REG_AH)
+ 
+    if (intno == 0x21 and ah == 0x2c) == False:
+        print(f"non ivt interrupt {intno:X}")
 
     if intno == 0x21: # DOS Services
         handle_int21(uc, vga_emulator)
@@ -192,18 +248,22 @@ def hook_interrupt(uc, intno, user_data):
     elif intno == 0x1A: # Get/Set System Time (BIOS)
         ah = uc.reg_read(UC_X86_REG_AH)
         if ah == 0x00: # Get System Time
-            # Returns CX:DX = number of clock ticks since midnight.
-            # AL = midnight counter, advanced each time midnight passes.
-            # Dummy values: 18.2 ticks/sec. 1 sec = ~18 ticks.
-            # Use current system time to provide more realistic values
-            current_time = time.time()
-            ticks_per_day = 18.20648 * 24 * 3600
-            ticks_since_midnight = int((current_time % (24 * 3600)) * 18.20648)
+            # BDA memory address for the timer tick counter
+            TIMER_TICK_ADDRESS = 0x46C 
+    
+            # Calculate a realistic tick count based on current time
+            counter_bytes = uc.mem_read(TIMER_TICK_ADDRESS, 4)
+            ticks_since_midnight = int.from_bytes(counter_bytes, 'little')
+
+            # The full 32-bit value
+            ticks_32bit = ticks_since_midnight & 0xFFFFFFFF
             
-            uc.reg_write(UC_X86_REG_CX, (ticks_since_midnight >> 16) & 0xFFFF)
-            uc.reg_write(UC_X86_REG_DX, ticks_since_midnight & 0xFFFF)
+            # 1. Set the registers for the program that called the interrupt
+            uc.reg_write(UC_X86_REG_CX, (ticks_32bit >> 16) & 0xFFFF)
+            uc.reg_write(UC_X86_REG_DX, ticks_32bit & 0xFFFF)
             uc.reg_write(UC_X86_REG_AL, 0x00) # Midnight counter (not emulated)
-            print(f"[*] INT 1Ah, AH=00h (Get System Time): CX:DX={hex(uc.reg_read(UC_X86_REG_CX))}:{hex(uc.reg_read(UC_X86_REG_DX))}")
+    
+            print(f"[*] INT 1Ah, AH=00h (Get System Time): CX:DX={hex(uc.reg_read(UC_X86_REG_CX))}:{hex(uc.reg_read(UC_X86_REG_DX))}, updated mem at 0x{TIMER_TICK_ADDRESS:x}")
         else:
             print(f"[*] Unhandled INT 1Ah function: AH={hex(ah)}. Stopping emulation.")
             uc.emu_stop()
@@ -245,31 +305,169 @@ def hook_interrupt(uc, intno, user_data):
     else:
         print(f"[*] Unhandled interrupt: {hex(intno)}. Stopping emulation.")
         uc.emu_stop()
+ 
+def hook_iret_dispatcher(uc, address, size, user_data):
+    """
+    This hook is triggered when the CPU executes an IRET instruction within our
+    virtual handler space (HANDLER_CODE_BASE). The offset from the base tells us
+    which interrupt number was originally called.
+    """
+    # The interrupt number is the offset from the start of our handler code block.
+    # Since the emulated PC is at the IRET instruction, the IP register holds this offset.
+    intno = uc.reg_read(UC_X86_REG_IP)
+    print(f"int {intno:X}")
+    
+    vga_emulator = user_data['vga_emulator'] # Get the VGA emulator instance
+
+    # --- Dispatch to the correct Python handler based on the interrupt number ---
+    if intno == 0x10: # Video Services (VGA BIOS)
+        handle_int10(uc, vga_emulator)
+    elif intno == 0x11: # Get BIOS equipment list
+        equipment_word = 0x4400 # 2 floppy drives, 80x25 CGA color
+        uc.mem_write(BIOS_DATA_AREA + 0x10, struct.pack("<H", equipment_word))
+        uc.reg_write(UC_X86_REG_AX, equipment_word)
+        print(f"[*] INT 11h (via IRET hook). AX={hex(equipment_word)}")
+    elif intno == 0x12: # Get memory size
+        total_memory_kb = (TOTAL_MEM_SIZE // 1024)
+        uc.mem_write(BIOS_DATA_AREA + 0x13, struct.pack("<H", total_memory_kb))
+        uc.reg_write(UC_X86_REG_AX, total_memory_kb)
+        print(f"[*] INT 12h (via IRET hook). AX={total_memory_kb} KB")
+    elif intno == 0x13: # Disk Services (BIOS)
+        ah = uc.reg_read(UC_X86_REG_AH)
+        if ah == 0x00: # Reset disk system
+            print(f"[*] INT 13h, AH=00h (Reset Disk System). Acknowledged.")
+            uc.reg_write(UC_X86_REG_AH, 0x00)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            eflags &= ~0x0001 # Clear Carry Flag (CF)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+        else:
+            print(f"[*] Unhandled INT 13h function: AH={hex(ah)}. Stopping emulation.")
+            uc.emu_stop()
+    elif intno == 0x15: # BIOS Services (e.g., Wait)
+        ah = uc.reg_read(UC_X86_REG_AH)
+        if ah == 0x86: # BIOS wait function
+            cx = uc.reg_read(UC_X86_REG_CX)
+            dx = uc.reg_read(UC_X86_REG_DX)
+            microseconds = (cx << 16) | dx
+            print(f"[*] INT 15h, AH=86h (BIOS Wait): {microseconds} us. (Ignoring delay)")
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            eflags &= ~0x0001 # Clear CF for success
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+        else:
+            print(f"[*] Unhandled INT 15h function: AH={hex(ah)}. Stopping emulation.")
+            uc.emu_stop()
+    elif intno == 0x16: # Keyboard Services (BIOS)
+        # This logic is now inside the hook_iret_dispatcher
+        ah = uc.reg_read(UC_X86_REG_AH)
+        if ah == 0x00: # Get keystroke
+            key_data = vga_emulator.get_buffered_key(remove=True)
+            if key_data:
+                ascii_val, scan_code = key_data
+                uc.reg_write(UC_X86_REG_AL, ascii_val)
+                uc.reg_write(UC_X86_REG_AH, scan_code)
+                print(f"[*] INT 16h, AH=00h (Get Keystroke): AL={hex(ascii_val)}, AH={hex(scan_code)}")
+            else:
+                print(f"[*] INT 16h, AH=00h (Get Keystroke): Waiting for key...")
+                vga_emulator.waiting_for_key = True
+                uc.emu_stop()
+        elif ah == 0x01: # Check for keystroke
+            key_data = vga_emulator.get_buffered_key(remove=False)
+            if key_data:
+                ascii_val, scan_code = key_data
+                uc.reg_write(UC_X86_REG_AL, ascii_val)
+                uc.reg_write(UC_X86_REG_AH, scan_code)
+                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+                eflags &= ~0x0040 # Clear ZF
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+                print(f"[*] INT 16h, AH=01h (Check Keystroke): ZF clear, key available.")
+            else:
+                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+                eflags |= 0x0040 # Set ZF
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags)
+                print(f"[*] INT 16h, AH=01h (Check Keystroke): ZF set (no key).")
+        else:
+            print(f"[*] Unhandled INT 16h function: AH={hex(ah)}. Stopping emulation.")
+            uc.emu_stop()
+    elif intno == 0x1A: # Get/Set System Time (BIOS)
+        ah = uc.reg_read(UC_X86_REG_AH)
+        if ah == 0x00: # Get System Time
+            TIMER_TICK_ADDRESS = 0x46C 
+    
+            # Calculate a realistic tick count based on current time
+            counter_bytes = uc.mem_read(TIMER_TICK_ADDRESS, 4)
+            ticks_since_midnight = int.from_bytes(counter_bytes, 'little')
+
+            # The full 32-bit value
+            ticks_32bit = ticks_since_midnight & 0xFFFFFFFF
+            
+            # 1. Set the registers for the program that called the interrupt
+            uc.reg_write(UC_X86_REG_CX, (ticks_32bit >> 16) & 0xFFFF)
+            uc.reg_write(UC_X86_REG_DX, ticks_32bit & 0xFFFF)
+            uc.reg_write(UC_X86_REG_AL, 0x00) # Midnight counter (not emulated)
+    
+            print(f"[*] INT 1Ah, AH=00h (Get System Time): CX:DX={hex(uc.reg_read(UC_X86_REG_CX))}:{hex(uc.reg_read(UC_X86_REG_DX))}, updated mem at 0x{TIMER_TICK_ADDRESS:x}")
+        else:
+            print(f"[*] Unhandled INT 1Ah function: AH={hex(ah)}. Stopping emulation.")
+            uc.emu_stop()
+    elif intno == 0x21: # DOS Services
+        handle_int21(uc, vga_emulator)
+    elif intno == 0x33: # Mouse Driver
+        ax = uc.reg_read(UC_X86_REG_AX)
+        if ax == 0x0000: # Mouse initialization
+            uc.reg_write(UC_X86_REG_AX, 0xFFFF)
+            uc.reg_write(UC_X86_REG_BX, 2)
+            print(f"[*] INT 33h, AX=0000h (Mouse Init): Success.")
+        elif ax == 0x0001: # Show mouse pointer
+            print(f"[*] INT 33h, AX=0001h (Show Mouse Pointer): Acknowledged.")
+        elif ax == 0x0002: # Hide mouse pointer
+            print(f"[*] INT 33h, AX=0002h (Hide Mouse Pointer): Acknowledged.")
+        elif ax == 0x0003: # Get mouse position and status
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            buttons = pygame.mouse.get_pressed()
+            button_status = (1 if buttons[0] else 0) | (2 if buttons[2] else 0)
+            uc.reg_write(UC_X86_REG_BX, button_status)
+            uc.reg_write(UC_X86_REG_CX, mouse_x)
+            uc.reg_write(UC_X86_REG_DX, mouse_y)
+            print(f"[*] INT 33h, AX=0003h (Get Mouse State).")
+        else:
+            print(f"[*] Unhandled INT 33h function: AX={hex(ax)}. Stopping emulation.")
+            uc.emu_stop()
+    else:
+        # This will catch any interrupt we haven't explicitly handled.
+        print(f"[*] Unhandled interrupt (via IRET hook): {hex(intno)}. Stopping emulation.")
+        # Print stack to see where it came from
+        ss = uc.reg_read(UC_X86_REG_SS)
+        sp = uc.reg_read(UC_X86_REG_SP)
+        # On IRET hook, the return address is still on stack: IP, CS, FLAGS
+        try:
+            stack_data = uc.mem_read(ss * 16 + sp, 6)
+            ret_ip, ret_cs, ret_flags = struct.unpack("<HHH", stack_data)
+            print(f"    Return address on stack is {ret_cs:04X}:{ret_ip:04X}")
+        except UcError as e:
+            print(f"    Could not read return address from stack: {e}")
+        uc.emu_stop()
+    # After the hook returns, Unicorn will execute the IRET, popping the original
+    # CS:IP and flags from the stack and resuming the program's execution.
     
 def hook_mem_write_vga(uc, access, address, size, value, user_data):
     """
-    Hook for monitoring writes to VGA memory (0xA0000-0xBFFFF).
-    This function will notify the VGA emulator to update its display.
+    Hook for writes to VGA memory. It now checks if the write was handled
+    by the planar logic.
     """
-    # This hook is specifically for UC_HOOK_MEM_WRITE, so 'access' will always be UC_MEM_WRITE.
-    # However, a robust check for future-proofing or combining hooks is good.
     if access == UC_MEM_WRITE:
         vga_emulator = user_data['vga_emulator']
         
-        # Check if the write falls within the VGA memory range
-        # A0000-BFFFF (128KB)
-        vga_start = VRAM_GRAPHICS_MODE
-        vga_end = VRAM_GRAPHICS_MODE + VGA_MEM_SIZE
-        
-        # Check for overlap: max(start1, start2) < min(end1, end2)
-        # Here, range1 is [address, address + size) and range2 is [vga_start, vga_end)
-        if max(address, vga_start) < min(address + size, vga_end):
-
-            vga_emulator.written_mem[address] = value 
-            # print(f"[*] VGA Memory Write: 0x{address:X} (size {size})") # Uncomment for verbose VRAM writes
-            # Inform the VGA emulator about the write.
-            # The emulator will then read the updated data from Unicorn's memory.
-            # vga_emulator.vga_memory_write_callback(address, size)
+        # Delegate to the VGA emulator's logic.
+        # If it returns True, the write has been fully handled by our planar logic.
+        # If it returns False, it's a simple mode, and we let Unicorn do the write.
+        if vga_emulator.handle_vram_write(uc, address, size, value):
+            # The write was handled by our custom logic, so we are done.
+            # We don't want Unicorn to perform the original write.
+            return
+        else:
+            # The write was not handled by our custom logic (e.g., text mode).
+            # We let the hook fall through, and Unicorn will perform the
+            # default memory write operation.
             pass
     
 def hook_mem_read_low(uc, access, address, size, value, user_data):
@@ -308,14 +506,64 @@ def hook_in(uc, port, size, user_data):
 
 def hook_out(uc, port, size, value, user_data):
     """
-    Handles an OUT instruction.
+    Handles an OUT instruction, delegating VGA ports to the emulator.
     """
     cs = uc.reg_read(UC_X86_REG_CS)
     ip = uc.reg_read(UC_X86_REG_IP)
+    
+    # Only print for non-VGA ports for cleaner logs, or keep for debugging.
+    if not (0x3C0 <= port <= 0x3CF) and not (0x3D4 <= port <= 0x3D5):
+        pass
     print(f"[OUT] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}  value=0x{value:X}")
+
+    # --- MODIFIED: Delegate to VGA Emulator ---
+    vga_emulator = user_data['vga_emulator']
+    vga_emulator.handle_port_write(port, value)
+
+IVT_BASE = 0x00000
+HANDLER_CODE_BASE = 0xF0000 # Use a high memory area for our virtual IRET handlers
+
+def setup_ivt_and_handlers(uc):
+    """
+    Initializes the Interrupt Vector Table (IVT) and our virtual IRET handlers.
+    """
+    print("[*] Setting up emulated Interrupt Vector Table (IVT) and IRET handlers...")
+    
+    # 1. Map a memory region for our handler code. A single 4KB page is sufficient.
+    #    This memory is separate from the main 1MB RAM to avoid being overwritten.
+    try:
+        uc.mem_map(HANDLER_CODE_BASE, 4096, UC_PROT_READ | UC_PROT_EXEC)
+    except UcError as e:
+        # This might happen if the memory is already part of a larger mapping.
+        # In our case, it's outside the 1MB DOS area, so it needs its own map.
+        print(f"Warning: Could not map handler memory at {HANDLER_CODE_BASE:X}. It might already be mapped. {e}")
+
+    # 2. Write the handler code. It's just 256 'IRET' instructions (opcode 0xCF).
+    iret_opcodes = bytes([0xCF] * 256)
+    uc.mem_write(HANDLER_CODE_BASE, iret_opcodes)
+
+    # 3. Populate the IVT (at physical address 0x00000).
+    #    Each entry in the IVT is a 4-byte far pointer (Offset, then Segment).
+    handler_segment = HANDLER_CODE_BASE >> 4
+    
+    for i in range(256):
+        # The address of the handler for interrupt 'i' is F000:00i
+        handler_offset = i
+        
+        # The IVT entry for interrupt 'i' is at physical address i * 4
+        ivt_entry_address = IVT_BASE + (i * 4)
+        
+        # Pack the CS:IP into little-endian format (IP first, then CS)
+        ivt_entry = struct.pack("<HH", handler_offset, handler_segment)
+        
+        # Write the entry to the IVT in emulated memory
+        uc.mem_write(ivt_entry_address, ivt_entry)
+
+    print(f"[*] IVT populated. All 256 interrupts now point to handlers at {handler_segment:04X}:[0000-00FF].")
 
 def extract_lz91_exe(filename):
     global UNPACKED_EXE_DUMPED
+    global last_tick_time
 
     try:
         with open(filename, 'rb') as f:
@@ -375,6 +623,8 @@ def extract_lz91_exe(filename):
     mu.mem_map(0, TOTAL_MEM_SIZE, UC_PROT_ALL)
     print(f"[*] Mapped total memory from 0x0 to {hex(TOTAL_MEM_SIZE)} ({TOTAL_MEM_SIZE // 1024} KB).")
 
+    setup_ivt_and_handlers(mu)
+
     # Load the executable content *after* the MZ header into memory
     # The program is loaded at LOAD_CODE_PHYSICAL_BASE (0x10000).
     mu.mem_write(LOAD_CODE_PHYSICAL_BASE, file_content[exe_start_offset_in_file:])
@@ -419,12 +669,13 @@ def extract_lz91_exe(filename):
 
     # Add hooks
     # Hook just the jmpf instruction. A JMPF is 3 bytes (opcode + segment:offset).
-    mu.hook_add(UC_HOOK_CODE, hook_code, user_data={'final_jmp_addr': final_jmp_physical_addr})
-    # begin=final_jmp_physical_addr, end=final_jmp_physical_addr + 3, 
+    # mu.hook_add(UC_HOOK_CODE, hook_code, user_data={'final_jmp_addr': final_jmp_physical_addr})
+    # mu.hook_add(UC_HOOK_CODE, hook_code, begin=final_jmp_physical_addr, end=final_jmp_physical_addr + 3, user_data={'final_jmp_addr': final_jmp_physical_addr})
+
     mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED, hook_mem_unmapped)
     mu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hook_mem_unmapped)
     mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_unmapped)
-    mu.hook_add(UC_HOOK_INTR, hook_interrupt, user_data={'vga_emulator': vga_emulator}) # Pass vga_emulator instance to hooks
+    mu.hook_add(UC_HOOK_INTR, hook_interrupt, user_data={'vga_emulator': vga_emulator})
     mu.hook_add(UC_HOOK_MEM_WRITE, hook_mem_write_vga, 
                 begin=VRAM_GRAPHICS_MODE, 
                 end=VRAM_GRAPHICS_MODE + VGA_MEM_SIZE - 1,
@@ -434,7 +685,12 @@ def extract_lz91_exe(filename):
                 end=0x10000 - 1,
                 user_data={'vga_emulator': vga_emulator})
     mu.hook_add(UC_HOOK_INSN,  hook_in,  None, 1, 0, UC_X86_INS_IN)
-    mu.hook_add(UC_HOOK_INSN,  hook_out, None, 1, 0, UC_X86_INS_OUT)
+    mu.hook_add(UC_HOOK_INSN,  hook_out,  {'vga_emulator': vga_emulator}, 1, 0, UC_X86_INS_OUT)
+
+    mu.hook_add(UC_HOOK_CODE, hook_iret_dispatcher,
+                begin=HANDLER_CODE_BASE,
+                end=HANDLER_CODE_BASE + 255, # Hook the entire block of 256 IRETs
+                user_data={'vga_emulator': vga_emulator})
 
 
     # Emulation loop
@@ -521,6 +777,11 @@ def extract_lz91_exe(filename):
                     pygame.time.Clock().tick(30) # Limit frame rate when waiting
                     continue # Skip Unicorn emulation in this iteration
             
+            current_time = time.time()
+            if current_time - last_tick_time >= TICK_INTERVAL_S:
+                emulate_timer_tick(mu)
+                last_tick_time = current_time
+
             # Continue emulation from current CS:IP
             current_cs = mu.reg_read(UC_X86_REG_CS)
             current_ip = mu.reg_read(UC_X86_REG_IP)
