@@ -299,6 +299,7 @@ def handle_int21(uc, vga_emulator):
         # print(f"    Get system time: {hour:02d}:{minute:02d}:{second:02d}.{hundredths:02d}")
 
     elif ah == 0x35: # Get Interrupt Vector
+        print("getting")
         al = uc.reg_read(UC_X86_REG_AL)
         vector_addr = al * 4
         try:

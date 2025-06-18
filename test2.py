@@ -130,6 +130,19 @@ def hook_mem_unmapped(uc, access, address, size, value, user_data):
     """
     Hook for debugging unmapped memory access errors.
     """
+    vga_emulator = user_data['vga_emulator']
+    print("unmapped", VRAM_GRAPHICS_MODE, address, VRAM_GRAPHICS_MODE + VGA_MEM_SIZE) 
+    # Check if the address falls within our intended VRAM range
+    if VRAM_GRAPHICS_MODE <= address < VRAM_GRAPHICS_MODE + VGA_MEM_SIZE:
+        # Delegate to a modified VRAM write handler that uses the internal buffer.
+        # It returns True if it handled the write.
+        #print("tell me why 0 ")
+        #vga_emulator.handle_vram_write(address, size, value)
+
+        #print("tell me why")
+        #return True # Signal to Unicorn that we handled the "error"
+        pass
+
     current_cs = uc.reg_read(UC_X86_REG_CS)
     current_ip = uc.reg_read(UC_X86_REG_IP)
     
@@ -143,7 +156,7 @@ def hook_mem_unmapped(uc, access, address, size, value, user_data):
         print(f"    Value: {value:X}")
     
     # Print more registers for debugging
-    print(f"    EFLAGS: {hex(uc.reg_read(UC_X86_REG_EFLAGS))}")
+    print(f"    ?? EFLAGS: {hex(uc.reg_read(UC_X86_REG_EFLAGS))}")
     print(f"    AX: {hex(uc.reg_read(UC_X86_REG_AX))}, BX: {hex(uc.reg_read(UC_X86_REG_BX))}, CX: {hex(uc.reg_read(UC_X86_REG_CX))}, DX: {hex(uc.reg_read(UC_X86_REG_DX))}")
     print(f"    SI: {hex(uc.reg_read(UC_X86_REG_SI))}, DI: {hex(uc.reg_read(UC_X86_REG_DI))}, BP: {hex(uc.reg_read(UC_X86_REG_BP))}")
     print(f"    DS: {hex(uc.reg_read(UC_X86_REG_DS))}, ES: {hex(uc.reg_read(UC_X86_REG_ES))}, SS: {hex(uc.reg_read(UC_X86_REG_SS))}, SP: {hex(uc.reg_read(UC_X86_REG_SP))}")
@@ -460,10 +473,10 @@ def hook_mem_write_vga(uc, access, address, size, value, user_data):
         # Delegate to the VGA emulator's logic.
         # If it returns True, the write has been fully handled by our planar logic.
         # If it returns False, it's a simple mode, and we let Unicorn do the write.
-        if vga_emulator.handle_vram_write(uc, address, size, value):
+        if vga_emulator.handle_vram_write(address, size=size, value=value):
             # The write was handled by our custom logic, so we are done.
             # We don't want Unicorn to perform the original write.
-            return
+            return True
         else:
             # The write was not handled by our custom logic (e.g., text mode).
             # We let the hook fall through, and Unicorn will perform the
@@ -513,8 +526,7 @@ def hook_out(uc, port, size, value, user_data):
     
     # Only print for non-VGA ports for cleaner logs, or keep for debugging.
     if not (0x3C0 <= port <= 0x3CF) and not (0x3D4 <= port <= 0x3D5):
-        pass
-    print(f"[OUT] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}  value=0x{value:X}")
+        print(f"[OUT] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}  value=0x{value:X}")
 
     # --- MODIFIED: Delegate to VGA Emulator ---
     vga_emulator = user_data['vga_emulator']
@@ -618,10 +630,10 @@ def extract_lz91_exe(filename):
     # Initialize Unicorn Engine for x86 16-bit mode
     mu = Uc(UC_ARCH_X86, UC_MODE_16)
 
-    # Map a 1MB contiguous region of memory for DOS conventional memory
-    TOTAL_MEM_SIZE = 0x100000 
+    TOTAL_MEM_SIZE = 1024 * 1024 * 16 
     mu.mem_map(0, TOTAL_MEM_SIZE, UC_PROT_ALL)
     print(f"[*] Mapped total memory from 0x0 to {hex(TOTAL_MEM_SIZE)} ({TOTAL_MEM_SIZE // 1024} KB).")
+
 
     setup_ivt_and_handlers(mu)
 
@@ -672,18 +684,24 @@ def extract_lz91_exe(filename):
     # mu.hook_add(UC_HOOK_CODE, hook_code, user_data={'final_jmp_addr': final_jmp_physical_addr})
     # mu.hook_add(UC_HOOK_CODE, hook_code, begin=final_jmp_physical_addr, end=final_jmp_physical_addr + 3, user_data={'final_jmp_addr': final_jmp_physical_addr})
 
-    mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED, hook_mem_unmapped)
-    mu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hook_mem_unmapped)
-    mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_unmapped)
+    #mu.hook_add(UC_HOOK_MEM_INVALID, hook_mem_unmapped, user_data={'vga_emulator': vga_emulator})
+    mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED, hook_mem_unmapped, user_data={'vga_emulator': vga_emulator})
+    mu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hook_mem_unmapped, user_data={'vga_emulator': vga_emulator})
+    mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_unmapped, user_data={'vga_emulator': vga_emulator})
+
+    #mu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hook_mem_unmapped, user_data={'vga_emulator': vga_emulator})
+    #mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_unmapped, user_data={'vga_emulator': vga_emulator})
+
     mu.hook_add(UC_HOOK_INTR, hook_interrupt, user_data={'vga_emulator': vga_emulator})
+
     mu.hook_add(UC_HOOK_MEM_WRITE, hook_mem_write_vga, 
                 begin=VRAM_GRAPHICS_MODE, 
                 end=VRAM_GRAPHICS_MODE + VGA_MEM_SIZE - 1,
                 user_data={'vga_emulator': vga_emulator})
-    mu.hook_add(UC_HOOK_MEM_WRITE, hook_mem_write_low, 
-                begin=0, 
-                end=0x10000 - 1,
-                user_data={'vga_emulator': vga_emulator})
+    #mu.hook_add(UC_HOOK_MEM_WRITE, hook_mem_write_low, 
+    #            begin=0, 
+    #            end=0x10000 - 1,
+    #            user_data={'vga_emulator': vga_emulator})
     mu.hook_add(UC_HOOK_INSN,  hook_in,  None, 1, 0, UC_X86_INS_IN)
     mu.hook_add(UC_HOOK_INSN,  hook_out,  {'vga_emulator': vga_emulator}, 1, 0, UC_X86_INS_OUT)
 
@@ -731,8 +749,7 @@ def extract_lz91_exe(filename):
                 mu_is_running = True # Signal that Unicorn can run again
 
         # 2. Run Unicorn emulation in steps
-        try:
-            if vga_emulator.waiting_for_key:
+        if vga_emulator.waiting_for_key:
                 # If waiting for a key, only run emulation after a key is available,
                 # or for a short period to allow other interrupts.
                 # If AH=01h or AH=07h is waiting, don't restart until key is buffered.
@@ -777,14 +794,17 @@ def extract_lz91_exe(filename):
                     pygame.time.Clock().tick(30) # Limit frame rate when waiting
                     continue # Skip Unicorn emulation in this iteration
             
-            current_time = time.time()
-            if current_time - last_tick_time >= TICK_INTERVAL_S:
-                emulate_timer_tick(mu)
-                last_tick_time = current_time
+        current_time = time.time()
+        if current_time - last_tick_time >= TICK_INTERVAL_S:
+            emulate_timer_tick(mu)
+            last_tick_time = current_time
 
-            # Continue emulation from current CS:IP
-            current_cs = mu.reg_read(UC_X86_REG_CS)
-            current_ip = mu.reg_read(UC_X86_REG_IP)
+        # Continue emulation from current CS:IP
+        current_cs = mu.reg_read(UC_X86_REG_CS)
+        current_ip = mu.reg_read(UC_X86_REG_IP)
+
+        try:
+            # other exceptions ????
             mu.emu_start(current_cs * 16 + current_ip, TOTAL_MEM_SIZE, count=instructions_per_step)
 
         except UcError as e:
@@ -792,7 +812,7 @@ def extract_lz91_exe(filename):
             running = False # Stop the main loop
             # Print registers for debugging
             print(f"    CS:IP = {hex(mu.reg_read(UC_X86_REG_CS))}:{hex(mu.reg_read(UC_X86_REG_IP))}")
-            print(f"    EFLAGS: {hex(mu.reg_read(UC_X86_REG_EFLAGS))}")
+            print(f"    ?? EFLAGS: {hex(mu.reg_read(UC_X86_REG_EFLAGS))}")
             print(f"    AX: {hex(mu.reg_read(UC_X86_REG_AX))}, BX: {hex(mu.reg_read(UC_X86_REG_BX))}, CX: {hex(mu.reg_read(UC_X86_REG_CX))}, DX: {hex(mu.reg_read(UC_X86_REG_DX))}")
             print(f"    SI: {hex(mu.reg_read(UC_X86_REG_SI))}, DI: {hex(mu.reg_read(UC_X86_REG_DI))}, BP: {hex(mu.reg_read(UC_X86_REG_BP))}")
             print(f"    DS: {hex(mu.reg_read(UC_X86_REG_DS))}, ES: {hex(mu.reg_read(UC_X86_REG_ES))}, SS: {hex(mu.reg_read(UC_X86_REG_SS))}, SP: {hex(mu.reg_read(UC_X86_REG_SP))}")

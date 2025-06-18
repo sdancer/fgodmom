@@ -1,175 +1,150 @@
+# test_vga.py
 import pygame
-import struct
+from unicorn import *
+from unicorn.x86_const import *
 
-# --- Mock Unicorn Engine for Testing ---
-# This class simulates the parts of Unicorn we need: mem_map and mem_read.
-class MockUnicorn:
-    def __init__(self, mem_size):
-        self.memory = bytearray(mem_size)
+# Import the VGAEmulator class and constants from your bios.py file
+try:
+    from bios import VGAEmulator, VRAM_GRAPHICS_MODE, VGA_MEM_SIZE
+except ImportError:
+    print("Error: Make sure 'bios.py' is in the same directory as this script.")
+    exit()
 
-    def mem_map(self, address, size):
-        # In a real scenario, you might check for overlaps, but for this test, it's a no-op.
-        pass
+# --- Unicorn and Memory Setup ---
+RAM_BASE = 0x0000
+RAM_SIZE = 1024 * 1024
 
-    def mem_read(self, address, size):
-        # Return a slice of the simulated memory.
-        return bytes(self.memory[address : address + size])
+def initialize_emulator():
+    """Sets up the Unicorn CPU and memory maps."""
+    print("Initializing Unicorn CPU and memory...")
+    uc = Uc(UC_ARCH_X86, UC_MODE_16)
+    uc.mem_map(RAM_BASE, RAM_SIZE)
+    print("Unicorn setup complete.")
+    return uc
 
-    def mem_write(self, address, data):
-        # Write data into the simulated memory.
-        end = address + len(data)
-        self.memory[address:end] = data
-
-# --- Minimal VGA Constants for the Test ---
-VRAM_GRAPHICS_MODE = 0xA0000
-VGA_MEM_SIZE = 0x20000 # 128KB
-VGA_PALETTE_16_COLORS = [
-    (0, 0, 0), (0, 0, 170), (0, 170, 0), (0, 170, 170),
-    (170, 0, 0), (170, 0, 170), (170, 85, 0), (170, 170, 170),
-    (85, 85, 85), (85, 85, 255), (85, 255, 85), (85, 255, 255),
-    (255, 85, 85), (255, 85, 255), (255, 255, 85), (255, 255, 255) # 15 = White
-]
-
-# --- A simplified VGAEmulator with only the necessary parts for rendering ---
-class VGARenderTest:
-    def __init__(self, uc_emulator):
-        self.uc = uc_emulator
-        self.screen = None
-        self.current_mode = None
-        self.display_width = 0
-        self.display_height = 0
-        self.vram_base = 0
-        self.is_text_mode = False
-        # Use the real palette for the test
-        self.palette_16_color = list(VGA_PALETTE_16_COLORS)
-
-    def set_mode(self, mode_id):
-        self.current_mode = mode_id
-        print(f"Setting video mode: {hex(mode_id)}")
-
-        if mode_id == 0x10: # 640x350 16-color graphics mode
-            self.display_width = 640
-            self.display_height = 350
-            self.vram_base = VRAM_GRAPHICS_MODE
-            self.is_text_mode = False
-        else:
-            raise ValueError(f"This test only supports mode 0x10, not {hex(mode_id)}")
-
-        self.screen = pygame.display.set_mode((self.display_width, self.display_height))
-        pygame.display.set_caption(f"VGA Render Test (Mode {hex(self.current_mode)})")
-        self.screen.fill((0, 0, 0)) # Start with a black screen
-        pygame.display.flip()
-
-    def render_frame(self):
-        """The exact rendering logic from your main emulator to be tested."""
-        if self.screen is None or self.is_text_mode:
-            return
-
-        # Simplified VRAM read for the test
-        read_size = VGA_MEM_SIZE
-        try:
-            vram_data = self.uc.mem_read(self.vram_base, read_size)
-        except Exception as e:
-            print(f"Error reading VRAM: {e}")
-            return
-
-        if self.current_mode == 0x10:
-            plane_size = 32768 # 32KB per plane in our model
-            width_in_bytes = self.display_width // 8
-
-            for y in range(self.display_height):
-                for x in range(self.display_width):
-                    offset = (y * width_in_bytes) + (x // 8)
-                    bit_pos = 7 - (x % 8)
-                    
-                    # Check bounds to prevent reading past our allocated memory
-                    if (offset + 3 * plane_size) >= len(vram_data):
-                       continue
-
-                    # Read the byte from each of the four planes
-                    byte_p0 = vram_data[offset]
-                    byte_p1 = vram_data[offset + plane_size]
-                    byte_p2 = vram_data[offset + 2 * plane_size]
-                    byte_p3 = vram_data[offset + 3 * plane_size]
-
-                    # Extract the single bit for our pixel from each plane's byte
-                    bit0 = (byte_p0 >> bit_pos) & 1
-                    bit1 = (byte_p1 >> bit_pos) & 1
-                    bit2 = (byte_p2 >> bit_pos) & 1
-                    bit3 = (byte_p3 >> bit_pos) & 1
-
-                    color_index = (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0
-                    color_rgb = self.palette_16_color[color_index]
-                    self.screen.set_at((x, y), color_rgb)
-        
-        pygame.display.flip()
-        print("Render frame complete.")
-
-
-def run_render_test():
-    """Main function to set up and run the rendering test."""
-    pygame.init()
-
-    # 1. Create mock instances
-    mock_uc = MockUnicorn(1024 * 1024) # 1MB of memory
-    vga_test = VGARenderTest(mock_uc)
-
-    # Map the VGA memory region in our mock Unicorn
-    mock_uc.mem_map(VRAM_GRAPHICS_MODE, VGA_MEM_SIZE)
-
-    # 2. Set the video mode
-    vga_test.set_mode(0x10)
-
-    # 3. Manually write test data to VRAM to draw a white rectangle
-    # We want to draw a 100x50 rectangle at position (50, 50) with color 15 (white)
-    print("Writing test pattern to mock VRAM...")
+def draw_square_low_level(uc: Uc, vga: VGAEmulator):
+    """
+    Simulates a DOS program drawing a square by manipulating VGA registers
+    and writing directly to VRAM, triggering the low-level hooks.
+    This test uses Mode 0x10 (planar) to test handle_vram_write.
+    """
+    print("\n--- Running LOW-LEVEL Square Drawing Test ---")
     
-    # Color 15 is binary 1111. This means we need to set the corresponding
-    # pixel bits to 1 in ALL FOUR planes.
-    rect_x, rect_y = 50, 50
-    rect_w, rect_h = 100, 50
+    # 1. Set a planar graphics mode to test the complex write logic.
+    MODE_640x350 = 0x10
+    vga.set_mode(MODE_640x350)
+    print(f"Set video mode to {hex(MODE_640x350)} (640x350, 16 colors)")
+
+    # 2. Define square properties.
+    square_x, square_y, square_size = 100, 50, 80
+    border_color_idx = 4  # Red
+    fill_color_idx = 12 # Light Red
+
+    # --- SIMULATE DOS PROGRAM DRAWING LOGIC ---
+
+    # A. Clear the screen to black (Color 0)
+    # This is a good test for Write Mode 2
+    print("Clearing screen to black (Color 0) using WM2...")
+    vga.handle_port_write(0x3CE, 5) # Select GC Mode Register
+    vga.handle_port_write(0x3CF, 2) # Set Write Mode 2
+    vga.handle_port_write(0x3CE, 0) # Select GC Set/Reset Register
+    vga.handle_port_write(0x3CF, 0) # Set color to 0 (Black)
+    vga.handle_port_write(0x3CE, 8) # Select GC Bit Mask Register
+    vga.handle_port_write(0x3CF, 0xFF) # Enable all bits
     
-    plane_size = 32768
-    width_in_bytes = vga_test.display_width // 8
+    # Write 0xFF to every byte in VRAM to trigger the clear
+    width_in_bytes = 640 // 8
+    for y in range(350):
+        for i in range(width_in_bytes):
+            offset = y * width_in_bytes + i
+            # This write will be intercepted by handle_vram_write
+            vga.handle_vram_write(VRAM_GRAPHICS_MODE + offset, b'\xFF'[0], 1)
 
-    # To set a bit to 1, we use a bitwise OR.
-    # We can pre-calculate the data for all planes.
-    plane0_data = bytearray(plane_size)
-    plane1_data = bytearray(plane_size)
-    plane2_data = bytearray(plane_size)
-    plane3_data = bytearray(plane_size)
-
-    for y in range(rect_y, rect_y + rect_h):
-        for x in range(rect_x, rect_x + rect_w):
-            offset = (y * width_in_bytes) + (x // 8)
+    # B. Draw the filled rectangle (Light Red)
+    print(f"Drawing filled rectangle with Light Red (Color {fill_color_idx}) using WM2...")
+    vga.handle_port_write(0x3CE, 0) # Select GC Set/Reset Register
+    vga.handle_port_write(0x3CF, fill_color_idx) # Set color to Light Red
+    
+    for y in range(square_y, square_y + square_size):
+        for x in range(square_x, square_x + square_size):
+            # Calculate VRAM address and the bit for this pixel
+            offset = y * width_in_bytes + (x // 8)
             bit_mask = 1 << (7 - (x % 8))
-            
-            # Since color is 15 (1111b), all plane bits are 1
-            plane0_data[offset] |= bit_mask
-            plane1_data[offset] |= bit_mask
-            plane2_data[offset] |= bit_mask
-            plane3_data[offset] |= bit_mask
+            # Write the bit mask to the VRAM address. In WM2, this tells the
+            # VGA "paint this specific pixel with the Set/Reset color".
+            vga.handle_vram_write(VRAM_GRAPHICS_MODE + offset, bytes([bit_mask])[0], 1)
 
-    # Write the prepared plane data into the mock Unicorn's memory
-    mock_uc.mem_write(VRAM_GRAPHICS_MODE, plane0_data)
-    mock_uc.mem_write(VRAM_GRAPHICS_MODE + plane_size, plane1_data)
-    mock_uc.mem_write(VRAM_GRAPHICS_MODE + 2 * plane_size, plane2_data)
-    mock_uc.mem_write(VRAM_GRAPHICS_MODE + 3 * plane_size, plane3_data)
+    # C. Draw the border (Red)
+    print(f"Drawing border with Red (Color {border_color_idx}) using WM2...")
+    vga.handle_port_write(0x3CE, 0) # Select GC Set/Reset Register
+    vga.handle_port_write(0x3CF, border_color_idx) # Set color to Red
+
+    # Top and bottom borders
+    for x in range(square_x, square_x + square_size):
+        # Top pixel
+        offset_top = square_y * width_in_bytes + (x // 8)
+        bit_mask_top = 1 << (7 - (x % 8))
+        vga.handle_vram_write(VRAM_GRAPHICS_MODE + offset_top, bytes([bit_mask_top])[0], 1)
+        # Bottom pixel
+        offset_bot = (square_y + square_size - 1) * width_in_bytes + (x // 8)
+        bit_mask_bot = 1 << (7 - (x % 8))
+        vga.handle_vram_write(VRAM_GRAPHICS_MODE + offset_bot, bytes([bit_mask_bot])[0], 1)
+
+    # Left and right borders
+    for y in range(square_y, square_y + square_size):
+        # Left pixel
+        offset_left = y * width_in_bytes + (square_x // 8)
+        bit_mask_left = 1 << (7 - (square_x % 8))
+        vga.handle_vram_write(VRAM_GRAPHICS_MODE + offset_left, bytes([bit_mask_left])[0], 1)
+        # Right pixel
+        offset_right = y * width_in_bytes + ((square_x + square_size - 1) // 8)
+        bit_mask_right = 1 << (7 - ((square_x + square_size - 1) % 8))
+        vga.handle_vram_write(VRAM_GRAPHICS_MODE + offset_right, bytes([bit_mask_right])[0], 1)
+
+    print("--- Low-level drawing instructions sent. ---")
+    print("--- VRAM should be modified via handle_vram_write hook. ---")
+
+
+def main():
+    """Main function to run the test."""
+    pygame.init()
     
-    print("Test pattern written. Rendering...")
+    uc = initialize_emulator()
+    vga = VGAEmulator(uc)
 
-    # 4. Call render_frame and run the Pygame loop
-    vga_test.render_frame()
+    # --- Setup Unicorn Hooks ---
+    # This is the most important part. We hook the memory write events
+    # in the VGA memory region so they get passed to our handler.
+    uc.hook_add(UC_HOOK_MEM_WRITE, 
+                lambda uc, type, address, size, value, user_data: vga.handle_vram_write(address, size, value),
+                begin=VRAM_GRAPHICS_MODE, 
+                end=VRAM_GRAPHICS_MODE + VGA_MEM_SIZE - 1)
+    print("Unicorn memory write hook for VRAM is now active.")
 
+    # Run the low-level drawing test
+    draw_square_low_level(uc, vga)
+    
+    # Main Pygame Loop to render the results
+    print("\nStarting main display loop. Press ESC or close the window to exit.")
     running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+    clock = pygame.time.Clock()
     
+    while running:
+        if not vga.process_input():
+            running = False
+            
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_ESCAPE]:
+            running = False
+
+        # ONLY use render_frame to visualize the VRAM state
+        vga.render_frame()
+
+        clock.tick(60)
+
+    print("Exiting.")
     pygame.quit()
 
-if __name__ == '__main__':
-    run_render_test()
+
+if __name__ == "__main__":
+    main()

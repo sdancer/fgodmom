@@ -65,32 +65,64 @@ VGA_PALETTE_256_COLORS = [(i, i, i) for i in range(256)]
 
 
 class VGAEmulator:
+    def _encode_ega_palette_color(self, rgb_tuple):
+        """
+        Encodes a 24-bit (R,G,B) tuple into the closest matching 6-bit EGA color.
+        This is the inverse of _decode_ega_palette_color.
+        """
+        r, g, b = rgb_tuple
+        # This is a simple "closest match" approach.
+        # Find the closest 2-bit index (0-3) for each 8-bit color component (0-255).
+        r_index = min(range(4), key=lambda i: abs(i * 85 - r))
+        g_index = min(range(4), key=lambda i: abs(i * 85 - g))
+        b_index = min(range(4), key=lambda i: abs(i * 85 - b))
+
+        # Extract high and low bits from the indices
+        r_prime, r_low = (r_index >> 1) & 1, r_index & 1
+        g_prime, g_low = (g_index >> 1) & 1, g_index & 1
+        b_prime, b_low = (b_index >> 1) & 1, b_index & 1
+
+        # Pack the bits into the R'G'B'RGB format
+        ega_color = (r_prime << 5) | (g_prime << 4) | (b_prime << 3) | \
+                    (r_low   << 2) | (g_low   << 1) | (b_low   << 0)
+        
+        return ega_color
     def _decode_ega_palette_color(self, ega_color):
         """
         Decodes a 6-bit EGA palette value (format R'G'B'RGB) into a 24-bit RGB tuple.
+        This is a corrected and clearer implementation.
         """
-        # Each color component has 2 bits, forming 4 levels of intensity.
-        # A common mapping to 8-bit values is [0, 85, 170, 255].
-        color_levels = [0, 85, 170, 255] # Use 0, 1/3, 2/3, 1 intensity levels
+        # Intensity levels for each 2-bit value: 0%, 33%, 66%, 100%
+        # A more standard mapping uses 0, 85, 170, 255.
+        print("hi")
+        color_levels = [0, 85, 170, 255]
 
-        # The two bits for each color are not contiguous.
-        # Red   = bit 5 (R') and bit 2 (R)
-        # Green = bit 4 (G') and bit 1 (G)
-        # Blue  = bit 3 (B') and bit 0 (B)
+        # Extract the individual R,G,B and R',G',B' bits.
+        r = (ega_color >> 2) & 1
+        g = (ega_color >> 1) & 1
+        b = (ega_color >> 0) & 1
         
-        r_index = ((ega_color >> 4) & 0x02) | ((ega_color >> 2) & 0x01)
-        g_index = ((ega_color >> 3) & 0x02) | ((ega_color >> 1) & 0x01)
-        b_index = ((ega_color >> 2) & 0x02) | ((ega_color >> 0) & 0x01)
+        r_prime = (ega_color >> 5) & 1
+        g_prime = (ega_color >> 4) & 1
+        b_prime = (ega_color >> 3) & 1
+
+        # Combine the high and low bits to form a 2-bit index for each color.
+        # high bit (prime) is the most significant bit.
+        r_index = (r_prime << 1) | r
+        g_index = (g_prime << 1) | g
+        b_index = (b_prime << 1) | b
         
-        r = color_levels[r_index]
-        g = color_levels[g_index]
-        b = color_levels[b_index]
+        # Look up the final 8-bit color component from the intensity levels.
+        final_r = color_levels[r_index]
+        final_g = color_levels[g_index]
+        final_b = color_levels[b_index]
         
-        return (r, g, b)
+        print("hi2", final_r, final_g, final_b)
+        return (final_r, final_g, final_b)
 
     def __init__(self, uc_emulator):
-        self.written_mem = {}
         self.uc = uc_emulator
+        self.vram = bytearray(VGA_MEM_SIZE)
         self.screen = None
         self.current_mode = None
         self.display_width = 0
@@ -378,7 +410,7 @@ class VGAEmulator:
 
         vram_addr = self.vram_base + y * self.display_width + x
         try:
-            color = self.uc.mem_read(vram_addr, 1)[0]
+            color = self.vram[vram_addr]
             return color
         except UcError as e:
             print(f"    Error reading pixel from VRAM at {hex(vram_addr)}: {e}")
@@ -499,6 +531,7 @@ class VGAEmulator:
             return
 
         if self.is_text_mode:
+            pass
             # Text mode rendering (e.g., 80x25, 40x25)
             page_size = self.chars_per_row * self.rows * 2
             vram_page_start_addr = self.vram_base + (self.active_page * page_size)
@@ -510,11 +543,7 @@ class VGAEmulator:
                 read_size = self.vram_base + VGA_MEM_SIZE - vram_page_start_addr
                 if read_size < 0: read_size = 0
 
-            try:
-                vram_data = self.uc.mem_read(vram_page_start_addr, read_size)
-            except UcError as e:
-                print(f"    Error reading VRAM for rendering: {e}. Skipping render.")
-                return
+            vram_data = self.vram
 
             self.screen.fill((0, 0, 0)) # Clear screen
             for row in range(self.rows):
@@ -566,12 +595,7 @@ class VGAEmulator:
             # Read the entire graphics VRAM segment (usually 64KB at 0xA0000)
             # For 640x350x16, each plane is 28,000 bytes. All 4 fit in 112KB,
             # so bank switching is needed. We'll assume the relevant part is mapped.
-        read_size = VGA_MEM_SIZE
-        try:
-            vram_data = self.uc.mem_read(self.vram_base, read_size)
-        except Exception as e:
-            print(f"Error reading VRAM: {e}")
-            return
+        vram_data = self.vram
 
         if self.current_mode == 0x10:
             plane_size = 32768 # 32KB per plane in our model
@@ -852,10 +876,10 @@ class VGAEmulator:
         # Graphics Controller Ports
         if port == 0x3CE:
             self.gc_index = value & 0x0F # Index is usually 4 bits
-            # print(f"DEBUG: VGA GC Index set to {self.gc_index}")
+             #print(f"DEBUG: VGA GC Index set to {self.gc_index}")
         elif port == 0x3CF:
             if self.gc_index < len(self.gc_registers):
-                # print(f"DEBUG: VGA GC Register {self.gc_index} set to 0x{value:02X}")
+                print(f"DEBUG: VGA GC Register {self.gc_index} set to 0x{value:02X}")
                 self.gc_registers[self.gc_index] = value
         
         # Sequencer Ports (often used for memory mapping and timing)
@@ -869,112 +893,88 @@ class VGAEmulator:
         
         # Other ports (CRTC 0x3D4/5, Attribute 0x3C0/1) would be handled here too.
 
-    def handle_vram_write(self, uc: Uc, address, size, value):
+    def handle_vram_write(self, address, size, value):
         """
         Handles a memory write to VRAM, applying VGA hardware logic.
-        Now includes Write Mode 0, Bit Mask, and Set/Reset logic.
+        This version corrects the handling of the Bit Mask in Write Mode 2.
         """
-        if self.is_text_mode or self.current_mode == 0x13:
-            return False # Let Unicorn perform the original write
+        if self.is_text_mode or self.current_mode not in [0x10, 0x12]:
+            print("error mode")
+            return False
 
         if size != 1:
-            return False # Only handle byte-sized writes
+            print("error size")
+            return False
 
-        # --- Get relevant VGA register states ---
         map_mask = self.sequencer_registers[2]
         write_mode = self.gc_registers[5] & 0x03
-        bit_mask = self.gc_registers[8]
-        set_reset_color = self.gc_registers[0] # The color for Write Mode 2
-        enable_set_reset = self.gc_registers[1]
+        logical_op = (self.gc_registers[3] >> 3) & 0x03
+        
+        # --- THIS IS THE KEY AREA FOR THE FIX ---
+        # Load the Bit Mask from the register into a local variable.
+        # Do NOT modify the stored register state (self.gc_registers[8]).
+        final_bit_mask = self.gc_registers[8]
+        # --- END OF KEY AREA ---
         
         vram_offset = address - self.vram_base
         plane_size = 32768
 
+        if not (0 <= vram_offset < plane_size):
+            print("error offset")
+            return False
+
         try:
-            # --- LATCH STEP: Read the current data from all 4 planes ---
-            latched_p0 = uc.mem_read(self.vram_base + vram_offset, 1)[0]
-            latched_p1 = uc.mem_read(self.vram_base + vram_offset + plane_size, 1)[0]
-            latched_p2 = uc.mem_read(self.vram_base + vram_offset + (2 * plane_size), 1)[0]
-            latched_p3 = uc.mem_read(self.vram_base + vram_offset + (3 * plane_size), 1)[0]
+            latched = [
+                self.vram[vram_offset],
+                self.vram[vram_offset + plane_size],
+                self.vram[vram_offset + 2 * plane_size],
+                self.vram[vram_offset + 3 * plane_size]
+            ]
             
-            final_p0, final_p1, final_p2, final_p3 = latched_p0, latched_p1, latched_p2, latched_p3
+            data_to_write = [0, 0, 0, 0]
 
-            # --- LOGIC STEP: Apply logic based on Write Mode ---
-            if write_mode == 2:
-                final_pixel_mask = value & bit_mask
-                
-                color_bit_p0 = (set_reset_color >> 0) & 1
-                color_bit_p1 = (set_reset_color >> 1) & 1
-                color_bit_p2 = (set_reset_color >> 2) & 1
-                color_bit_p3 = (set_reset_color >> 3) & 1
-                
-                # Start with the latched values
-                new_p0, new_p1, new_p2, new_p3 = latched_p0, latched_p1, latched_p2, latched_p3
-
-                # Only modify the planes that are enabled
-                if (enable_set_reset >> 0) & 1:
-                    new_p0 = (latched_p0 & ~final_pixel_mask) | (color_bit_p0 * final_pixel_mask)
-                
-                if (enable_set_reset >> 1) & 1:
-                    new_p1 = (latched_p1 & ~final_pixel_mask) | (color_bit_p1 * final_pixel_mask)
-                
-                if (enable_set_reset >> 2) & 1:
-                    new_p2 = (latched_p2 & ~final_pixel_mask) | (color_bit_p2 * final_pixel_mask)
-                
-                if (enable_set_reset >> 3) & 1:
-                    new_p3 = (latched_p3 & ~final_pixel_mask) | (color_bit_p3 * final_pixel_mask)
-
-                # Assign the final results
-                final_p0, final_p1, final_p2, final_p3 = new_p0, new_p1, new_p2, new_p3
-                #set_reset_color = int(random.random() * 15)
-                #final_p0 = (set_reset_color >> 0) & 1  # -> (9 >> 0) & 1 = 1
-                #final_p1 = (set_reset_color >> 1) & 1  # -> (9 >> 1) & 1 = 0
-                #final_p2 = (set_reset_color >> 2) & 1  # -> (9 >> 2) & 1 = 0
-                #final_p3 = (set_reset_color >> 3) & 1  # -> (9 >> 3) & 1 = 1
-        
-
-            elif write_mode == 0:
-                # This is the more complex mode. We can keep our previous bit-by-bit
-                # implementation here as a fallback.
+            if write_mode == 0:
                 enable_set_reset = self.gc_registers[1]
-                temp_p0, temp_p1, temp_p2, temp_p3 = 0, 0, 0, 0
-                for i in range(8):
-                    bit_i_mask = 1 << i
-                    if value & bit_i_mask:
-                        p0_bit = (set_reset_color >> 0) & 1 if (enable_set_reset >> 0) & 1 else (latched_p0 >> i) & 1
-                        p1_bit = (set_reset_color >> 1) & 1 if (enable_set_reset >> 1) & 1 else (latched_p1 >> i) & 1
-                        p2_bit = (set_reset_color >> 2) & 1 if (enable_set_reset >> 2) & 1 else (latched_p2 >> i) & 1
-                        p3_bit = (set_reset_color >> 3) & 1 if (enable_set_reset >> 3) & 1 else (latched_p3 >> i) & 1
+                set_reset_color = self.gc_registers[0]
+                for i in range(4):
+                    if (enable_set_reset >> i) & 1:
+                        data_to_write[i] = 0xFF if (set_reset_color >> i) & 1 else 0x00
                     else:
-                        p0_bit, p1_bit, p2_bit, p3_bit = (latched_p0 >> i) & 1, (latched_p1 >> i) & 1, (latched_p2 >> i) & 1, (latched_p3 >> i) & 1
+                        data_to_write[i] = value
 
-                    if not (bit_mask & bit_i_mask):
-                        p0_bit, p1_bit, p2_bit, p3_bit = (latched_p0 >> i) & 1, (latched_p1 >> i) & 1, (latched_p2 >> i) & 1, (latched_p3 >> i) & 1
-                    
-                    temp_p0 |= (p0_bit << i)
-                    temp_p1 |= (p1_bit << i)
-                    temp_p2 |= (p2_bit << i)
-                    temp_p3 |= (p3_bit << i)
-                final_p0, final_p1, final_p2, final_p3 = temp_p0, temp_p1, temp_p2, temp_p3
-            
-            # --- WRITE STEP: Write the final calculated data to the enabled planes ---
-            if map_mask & 0x01:
-                uc.mem_write(self.vram_base + vram_offset, bytes([final_p0]))
-            if map_mask & 0x02:
-                uc.mem_write(self.vram_base + vram_offset + plane_size, bytes([final_p1]))
-            if map_mask & 0x04:
-                uc.mem_write(self.vram_base + vram_offset + (2 * plane_size), bytes([final_p2]))
-            if map_mask & 0x08:
-                uc.mem_write(self.vram_base + vram_offset + (3 * plane_size), bytes([final_p3]))
+            elif write_mode == 2:
+                set_reset_color = self.gc_registers[0]
+                for i in range(4):
+                    data_to_write[i] = 0xFF if (set_reset_color >> i) & 1 else 0x00
+                
+                # --- THIS IS THE FIX ---
+                # In WM2, the final mask for the operation is the register's value
+                # ANDed with the CPU's value. Use the local variable.
+                final_bit_mask &= value
+                # --- END OF FIX ---
 
-            print(f"wrote with mask off: {vram_offset:X} mask: {map_mask:X} val: {value:X} ", final_p0, final_p1, final_p2, final_p3)
+            else:
+                return False
 
-        except UcError as e:
+            final_planes = [0, 0, 0, 0]
+            for i in range(4):
+                plane_data = data_to_write[i]
+                if logical_op == 1: plane_data &= latched[i]
+                elif logical_op == 2: plane_data |= latched[i]
+                elif logical_op == 3: plane_data ^= latched[i]
+
+                # Use the calculated final_bit_mask for this single operation
+                final_planes[i] = (latched[i] & ~final_bit_mask) | (plane_data & final_bit_mask)
+
+            if map_mask & 0x01: self.vram[vram_offset] = final_planes[0]
+            if map_mask & 0x02: self.vram[vram_offset + plane_size] = final_planes[1]
+            if map_mask & 0x04: self.vram[vram_offset + 2 * plane_size] = final_planes[2]
+            if map_mask & 0x08: self.vram[vram_offset + 3 * plane_size] = final_planes[3]
+
+        except (UcError, IndexError) as e:
             print(f"ERROR in planar VRAM write logic at {hex(address)}: {e}")
             
-        return True # We have handled the write.
-
-
+        return True
 
 
 
@@ -1298,6 +1298,7 @@ def handle_int10(uc, vga_emulator):
                 for i in range(16):
                     new_color_rgb = vga_emulator._decode_ega_palette_color(palette_bytes[i])
                     vga_emulator.palette_16_color[i] = new_color_rgb
+                vga_emulator.palette_16_color = VGA_PALETTE_16_COLORS
                 print(vga_emulator.palette_16_color)
                 print(f"      Palette updated successfully.")
             except UcError as e:
@@ -1305,6 +1306,32 @@ def handle_int10(uc, vga_emulator):
         elif al == 0x03: # Toggle Intensity/Blinking
             bl = uc.reg_read(UC_X86_REG_BL) # 0=enable intensive, 1=enable blinking
             print(f"    Toggle Intensity/Blinking: {bl}. (Not fully implemented)")
+        elif al == 0x07: # Get Individual Palette Register
+            bl = uc.reg_read(UC_X86_REG_BL) # Palette register index (0-15)
+            if 0 <= bl < 16:
+                rgb_tuple = self.palette_16_color[bl]
+                ega_val = self._encode_ega_palette_color(rgb_tuple)
+                uc.reg_write(UC_X86_REG_BH, ega_val)
+                print(f"    Get Palette Register {bl}: returning value {hex(ega_val)}")
+            else:
+                print(f"    Warning: Invalid palette register index {bl} for read.")
+
+        elif al == 0x09: # Get All 16 Palette Registers
+            dx = uc.reg_read(UC_X86_REG_DX)
+            es = uc.reg_read(UC_X86_REG_ES)
+            buffer_addr = es * 16 + dx
+            print(f"    Get All Palette Registers to buffer {hex(buffer_addr)}.")
+            try:
+                # Create a 16-byte array with the encoded palette data
+                palette_bytes = bytearray(16)
+                for i in range(16):
+                    palette_bytes[i] = self._encode_ega_palette_color(self.palette_16_color[i])
+                
+                # Write the data to the game's buffer in emulated memory
+                uc.mem_write(buffer_addr, bytes(palette_bytes))
+                print(f"      Successfully wrote encoded palette to buffer.")
+            except UcError as e:
+                print(f"      ERROR writing palette data to buffer: {e}")
         elif al == 0x10: # Set Individual DAC Register (256-color palette)
             bx = uc.reg_read(UC_X86_REG_BX) # Color register index
             dh = uc.reg_read(UC_X86_REG_DH) # Red value (0-63)
