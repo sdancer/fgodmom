@@ -52,14 +52,10 @@ VGA_PALETTE_16_COLORS = [
     (0x54, 0xFC, 0xFC), # B - Light Cyan
     (0xFC, 0x54, 0x54), # C - Light Red
     (0xFC, 0x54, 0xFC), # D - Light Magenta
-    (0xFC, 0x54, 0xFC), # E - Yellow
+    (0xFC, 0xFC, 0x54), # E - Yellow
     (0xFC, 0xFC, 0xFC), # F - White
 ]
 
-# Mode 13h (320x200, 256 colors) default palette for now.
-# In a real scenario, this would be set by INT 10h subfunctions.
-# For simplicity, we'll use a simple grayscale or fixed palette if mode 13h is used.
-# Let's define a simple 256-color palette for mode 13h, e.g., a grayscale.
 # In a real game, this palette would be loaded.
 VGA_PALETTE_256_COLORS = [(i, i, i) for i in range(256)]
 
@@ -94,7 +90,6 @@ class VGAEmulator:
         """
         # Intensity levels for each 2-bit value: 0%, 33%, 66%, 100%
         # A more standard mapping uses 0, 85, 170, 255.
-        print("hi")
         color_levels = [0, 85, 170, 255]
 
         # Extract the individual R,G,B and R',G',B' bits.
@@ -117,7 +112,6 @@ class VGAEmulator:
         final_g = color_levels[g_index]
         final_b = color_levels[b_index]
         
-        print("hi2", final_r, final_g, final_b)
         return (final_r, final_g, final_b)
 
     def __init__(self, uc_emulator):
@@ -283,8 +277,8 @@ class VGAEmulator:
             self.chars_per_row = 80
             self.rows = 25
         elif mode_id == 0x10: # 640x350 16-color graphics mode (EGA/VGA)
-            self.display_width = 640
-            self.display_height = 350
+            self.display_width = 640 
+            self.display_height = 350 
             self.vram_base = VRAM_GRAPHICS_MODE # Starts at 0xA0000
             self.is_text_mode = False
             self.reset_vga_registers() 
@@ -308,7 +302,8 @@ class VGAEmulator:
         if self.screen is None or \
            self.screen.get_width() != self.display_width or \
            self.screen.get_height() != self.display_height:
-            self.screen = pygame.display.set_mode((self.display_width, self.display_height))
+            self.screen = pygame.display.set_mode((self.display_width * 2, self.display_height * 2))
+            self.logical_screen = pygame.Surface((self.display_width, self.display_height))
             pygame.display.set_caption(f"Unicorn DOS Emulator (Mode {hex(self.current_mode)})")
 
         # Clear screen on mode change
@@ -587,9 +582,9 @@ class VGAEmulator:
         else: # Graphics mode rendering (e.g., 320x200, 256 colors)
            self.render_graph() 
         
+        scaled_surface = pygame.transform.scale(self.logical_screen, self.screen.get_size())
+        self.screen.blit(scaled_surface, (0, 0))
         pygame.display.flip()
-        # DEBUG: Confirm screen flip
-        # print(f"DEBUG: Pygame screen flipped for mode {hex(self.current_mode)}")
 
     def render_graph(self): 
             # Read the entire graphics VRAM segment (usually 64KB at 0xA0000)
@@ -608,7 +603,8 @@ class VGAEmulator:
                     
                     # Check bounds to prevent reading past our allocated memory
                     if (offset + 3 * plane_size) >= len(vram_data):
-                       continue
+                        print("error on render_frame")
+                        continue
 
                     # Read the byte from each of the four planes
                     byte_p0 = vram_data[offset]
@@ -624,7 +620,8 @@ class VGAEmulator:
 
                     color_index = (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0
                     color_rgb = self.palette_16_color[color_index]
-                    self.screen.set_at((x, y), color_rgb)
+                    self.logical_screen.set_at((x, y), color_rgb)
+
              # --- Handle Mode 0x13 (Linear Packed-Pixel) ---
         if self.current_mode == 0x13:
                 for y in range(self.display_height):
@@ -633,7 +630,7 @@ class VGAEmulator:
                         if offset >= len(vram_data): break
                         color_index = vram_data[offset]
                         color_rgb = VGA_PALETTE_256_COLORS[color_index]
-                        self.screen.set_at((x, y), color_rgb)
+                        self.logical_screen.set_at((x, y), color_rgb)
 
 
     def process_input(self):
@@ -782,75 +779,6 @@ class VGAEmulator:
         self._write_bios_kb_ptr(KB_BUFFER_TAIL_PTR, KB_BUFFER_START_OFFSET)
         print("    BIOS Keyboard buffer flushed.")
 
-    def dump_all_text_pages_to_console(self):
-        """
-        Dumps the content of all available text video pages to the console.
-        Non-zero characters are drawn as themselves (CP437), zero/control chars as '.'.
-        """
-        if not self.is_text_mode:
-            print("\n--- Cannot dump text pages: Currently in graphics mode. ---")
-            return
-
-        print("\n" + "=" * (self.chars_per_row + 10))
-        print(f"--- DUMPING ALL TEXT PAGES (Mode {hex(self.current_mode)}, {self.chars_per_row}x{self.rows}) ---")
-        
-        page_size_bytes = self.chars_per_row * self.rows * 2
-        
-        # Determine number of pages to dump.
-        # Standard text VRAM region (0xB8000 to 0xBFFF) is 32KB (0x8000 bytes).
-        # This allows 8 pages of 80x25 (4000 bytes/page) or 16 pages of 40x25 (2000 bytes/page).
-        # We will dump up to 8 pages as a common useful range for debugging.
-        num_pages_to_dump = 8 
-
-        for page_num in range(num_pages_to_dump):
-            page_start_addr = self.vram_base + (page_num * page_size_bytes)
-            
-            # Check if this page address is within the overall mapped VGA_MEM_SIZE
-            # The text VRAM starts at 0xB8000, and VGA_MEM_SIZE is 0x20000.
-            # So, the accessible range is 0xB8000 to 0xB8000 + 0x20000 - 1 = 0xD7FFF.
-            if page_start_addr >= (self.vram_base + VGA_MEM_SIZE):
-                print(f"--- Page {page_num} ({hex(page_start_addr)}) is beyond mapped VRAM. Stopping. ---")
-                break
-
-            # Calculate actual read size for the page, clamped by total mapped VRAM.
-            read_size_for_page = min(page_size_bytes, (self.vram_base + VGA_MEM_SIZE) - page_start_addr)
-            if read_size_for_page <= 0:
-                print(f"--- Page {page_num} ({hex(page_start_addr)}) cannot be read (size {read_size_for_page}). Stopping. ---")
-                break
-
-            try:
-                vram_data = self.uc.mem_read(page_start_addr, read_size_for_page)
-            except UcError as e:
-                print(f"--- Error reading VRAM for page {page_num} at {hex(page_start_addr)}: {e}. Skipping page. ---")
-                continue
-
-            print(f"\n--- Page {page_num} (VRAM {hex(page_start_addr)}) (Active Page: {'YES' if page_num == self.active_page else 'NO'}) ---")
-            for r in range(self.rows):
-                row_string = ""
-                for c in range(self.chars_per_row):
-                    offset = (r * self.chars_per_row + c) * 2
-                    # Ensure we don't read past the end of actual data read for the page
-                    if offset + 1 >= len(vram_data): 
-                        char_code = 0x20 # Default to space if data incomplete
-                    else:
-                        char_code = vram_data[offset]
-                    
-                    # Convert char_code to printable character, handling non-zero and control chars
-                    if char_code == 0x00:
-                        display_char = ' ' # Space for null (zero character)
-                    elif 0x01 <= char_code <= 0x1F or char_code == 0x7F: # Control characters (and DEL)
-                        display_char = '.' # Dot for non-printable control characters
-                    else:
-                        try:
-                            # Use CP437 decoding for DOS characters (non-zero character)
-                            display_char = bytes([char_code]).decode('cp437', errors='replace')
-                        except Exception:
-                            display_char = '?' # Fallback for decoding errors
-                    row_string += display_char
-                print(row_string)
-            print("-" * self.chars_per_row)
-        print("=" * (self.chars_per_row + 10) + "\n")
-
     def reset_vga_registers(self):
             # Reset Graphics Controller registers
             self.gc_registers = [0] * 9
@@ -862,7 +790,7 @@ class VGAEmulator:
             self.gc_registers[8] = 0xFF # Bit Mask: All bits enabled
 
             # Reset Sequencer registers
-            self.sequencer_registers = [0] * 5
+            self.sequencer_registers = [0] * 5 
             # Common defaults for graphics modes:
             self.sequencer_registers[1] = 0x01 # Clocking Mode: Normal operation
             self.sequencer_registers[2] = 0x0F # <<<< THE IMPORTANT ONE: Map Mask, all planes enabled
@@ -890,6 +818,11 @@ class VGAEmulator:
             if self.sequencer_index < len(self.sequencer_registers):
                 print(f"DEBUG: VGA Sequencer Register {self.sequencer_index} set to 0x{value:02X}")
                 self.sequencer_registers[self.sequencer_index] = value
+            else:
+                print(f"DEBUG: ignoring port {port:X}")
+
+        else:
+            print(f"DEBUG: ignoring port {port:X}")
         
         # Other ports (CRTC 0x3D4/5, Attribute 0x3C0/1) would be handled here too.
 
@@ -1252,7 +1185,7 @@ def handle_int10(uc, vga_emulator):
             uc.reg_write(UC_X86_REG_BL, 0x00) # 64KB video memory (common for basic VGA)
             uc.reg_write(UC_X86_REG_CH, 0x00) # Switch active display
             uc.reg_write(UC_X86_REG_CL, 0x00) # Switch inactive display
-            uc.reg_write(UC_X86_REG_DX, 0x00) # Monitor type (0=mono, 1=color) - often ignored by games.
+            uc.reg_write(UC_X86_REG_DX, 0x01) # Monitor type (0=mono, 1=color) - often ignored by games.
         elif bl == 0x20: # Select default palette loading (VGA)
             print(f"    INT 10h, AH=12h, BL=20h (Select default palette loading). Acknowledged.")
             # No return values.
