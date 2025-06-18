@@ -467,7 +467,6 @@ def hook_mem_write_vga(uc, access, address, size, value, user_data):
     Hook for writes to VGA memory. It now checks if the write was handled
     by the planar logic.
     """
-    return True
     if access == UC_MEM_WRITE:
         vga_emulator = user_data['vga_emulator']
         
@@ -482,7 +481,7 @@ def hook_mem_write_vga(uc, access, address, size, value, user_data):
             # The write was not handled by our custom logic (e.g., text mode).
             # We let the hook fall through, and Unicorn will perform the
             # default memory write operation.
-            return True
+            return False 
     
 def hook_mem_read_low(uc, access, address, size, value, user_data):
     """
@@ -702,7 +701,7 @@ def extract_lz91_exe(filename):
     #mu.hook_add(UC_HOOK_MEM_WRITE, hook_mem_write_low, 
     #            begin=0, 
     #            end=0x10000 - 1,
-    #            user_data={'vga_emulator': vga_emulator})
+    #            user_data#={'vga_emulator': vga_emulator})
     mu.hook_add(UC_HOOK_INSN,  hook_in,  None, 1, 0, UC_X86_INS_IN)
     mu.hook_add(UC_HOOK_INSN,  hook_out,  {'vga_emulator': vga_emulator}, 1, 0, UC_X86_INS_OUT)
 
@@ -736,6 +735,8 @@ def extract_lz91_exe(filename):
         while vga_emulator.pygame_keyboard_buffer:
             ascii_val, scan_code = vga_emulator.pygame_keyboard_buffer.popleft()
             if scan_code == 0x46:
+
+                open("dump.layer", "wb").write(vga_emulator.vram_shadow)
                 cur_addr = mu.reg_read(UC_X86_REG_CS) * 16 + mu.reg_read(UC_X86_REG_IP)
                 print(f"+ debug {mu.reg_read(UC_X86_REG_CS):X} {mu.reg_read(UC_X86_REG_IP):X}")
                 print(vga_emulator.written_mem)

@@ -116,6 +116,7 @@ class VGAEmulator:
 
     def __init__(self, uc_emulator):
         self.uc = uc_emulator
+        self.vram_shadow = bytearray(VGA_MEM_SIZE)
         self.screen = None
         self.current_mode = None
         self.display_width = 0
@@ -256,6 +257,8 @@ class VGAEmulator:
         """Sets the active video mode and configures Pygame display."""
         if self.current_mode == mode_id:
             return
+
+        #self.vram_shadow = bytearray(VGA_MEM_SIZE)
 
         self.current_mode = mode_id
         print(f"    Setting video mode: {hex(mode_id)}")
@@ -537,8 +540,7 @@ class VGAEmulator:
                 read_size = self.vram_base + VGA_MEM_SIZE - vram_page_start_addr
                 if read_size < 0: read_size = 0
 
-            
-            vram_data = self._vram_view(0, read_size)
+            vram_data = self.vram_shadow
 
             self.screen.fill((0, 0, 0)) # Clear screen
             for row in range(self.rows):
@@ -586,17 +588,16 @@ class VGAEmulator:
         self.screen.blit(scaled_surface, (0, 0))
         pygame.display.flip()
 
-    def _vram_view(self, start, length):
-        return self.uc.mem_read(self.vram_base + start, length)
 
     def render_graph(self): 
             # Read the entire graphics VRAM segment (usually 64KB at 0xA0000)
             # For 640x350x16, each plane is 28,000 bytes. All 4 fit in 112KB,
             # so bank switching is needed. We'll assume the relevant part is mapped.
         plane_size = 32768
-        vram_data = self._vram_view(0, plane_size*4)
+        vram_data = self.vram_shadow
 
         if self.current_mode == 0x10:
+
             plane_size = 32768 # 32KB per plane in our model
             width_in_bytes = self.display_width // 8
 
@@ -834,9 +835,10 @@ class VGAEmulator:
             return False  # Let Unicorn handle the write for text/linear modes.
 
         # Handle multi-byte writes by processing each byte individually.
+        # print(f"{address:X} {size:X}")
         for i in range(size):
             byte_to_write = (value >> (i * 8)) & 0xFF
-            self._write_planar_byte(address + i, byte_to_write)
+            self._write_planar_byte(address + i, value = byte_to_write)
         
         return True # We have handled the memory write.
 
@@ -863,15 +865,16 @@ class VGAEmulator:
         if not (0 <= offset_in_window < plane_size):
             # In a real VGA, this might wrap or be handled by odd/even mode.
             # For this emulator, we'll ignore writes outside the first 32KB per plane.
+            print("outside first plane window")
             return
 
         try:
             # Latch (read) the byte from all 4 planes at the target offset.
             latched_bytes = [
-                self.uc.mem_read(self.vram_base + offset_in_window, 1)[0],
-                self.uc.mem_read(self.vram_base + offset_in_window + plane_size, 1)[0],
-                self.uc.mem_read(self.vram_base + offset_in_window + 2 * plane_size, 1)[0],
-                self.uc.mem_read(self.vram_base + offset_in_window + 3 * plane_size, 1)[0]
+                self.vram_shadow[offset_in_window],
+                self.vram_shadow[offset_in_window + plane_size],
+                self.vram_shadow[offset_in_window + 2 * plane_size],
+                self.vram_shadow[offset_in_window + 3 * plane_size]
             ]
         except UcError as e:
             print(f"ERROR latching VRAM at addr {hex(address)}: {e}")
@@ -880,6 +883,7 @@ class VGAEmulator:
         # --- 3. Data Processing Phase ---
         # Figure out what data to write to each plane based on the write mode.
         processed_data = [0] * 4
+
 
         if write_mode == 0:
             # For each plane, decide if we use CPU data or expanded Set/Reset data.
@@ -908,14 +912,21 @@ class VGAEmulator:
         
             # --------------------------- ❷ CALCULATE NEW BYTE PER PLANE ---------------
             for p in range(4):
-                map_mask = 14 
                 if not ((map_mask >> p) & 1):
                     continue      # this plane is write‑protected
+
+                #if p == 0:
+                #    sr_expanded[p] = 0xff
+                #    cpu_pattern = 0xff
         
                 # Select SR or old latched data **per bit** according to cpu_pattern
                 src = (sr_expanded[p] & cpu_pattern) | (latched_bytes[p] & ~cpu_pattern)
         
+                # bit_mask_reg = 0xff
+
                 # Apply logical operation with the original latched data
+                if   func_select == 0:
+                    src = cpu_pattern & sr_expanded[p]
                 if   func_select == 1:  src &= latched_bytes[p]   # AND
                 elif func_select == 2:  src |= latched_bytes[p]   # OR
                 elif func_select == 3:  src ^= latched_bytes[p]   # XOR
@@ -925,8 +936,14 @@ class VGAEmulator:
                 final_byte = (latched_bytes[p] & ~bit_mask_reg) | (src & bit_mask_reg)
         
                 # ----------------------- ❸ COMMIT TO VRAM -----------------------------
-                plane_addr = self.vram_base + offset_in_window + p*plane_size
+                shadow_offset = offset_in_window + p*plane_size
                 #self.uc.mem_write(plane_addr, bytes([final_byte]))
+                  
+                if 0 <= shadow_offset < len(self.vram_shadow):
+                    self.vram_shadow[shadow_offset] = final_byte
+                    pass
+                else:
+                    print("error, offset")
             return
 
         elif write_mode == 3:
@@ -959,7 +976,10 @@ class VGAEmulator:
                 # Finally, write the resulting byte to the plane's memory.
                 try:
                     plane_addr = self.vram_base + offset_in_window + (i * plane_size)
-                    self.uc.mem_write(plane_addr, bytes([final_byte]))
+                    #self.uc.mem_write(plane_addr, bytes([final_byte]))
+                    shadow_offset = plane_addr - self.vram_base
+                    if shadow_offset < len(self.vram_shadow):
+                        self.vram_shadow[shadow_offset] = final_byte
                 except UcError as e:
                     print(f"ERROR writing to plane {i} at {hex(plane_addr)}: {e}")
 
@@ -1199,8 +1219,7 @@ def _handle_int10_ah10_palette(uc, vga_emulator):
         palette_bytes = uc.mem_read(addr, 16)
         for i, val in enumerate(palette_bytes):
             vga_emulator.palette_16_color[i] = vga_emulator._decode_ega_palette_color(val)
-            if vga_emulator.palette_16_color[i] == 0:
-                vga_emulator.palette_16_color[i] = VGA_PALETTE_16_COLORS[i]
+            vga_emulator.palette_16_color[i] = VGA_PALETTE_16_COLORS[i]
         print("      Palette updated successfully.")
         return True
     
