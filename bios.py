@@ -825,81 +825,115 @@ class VGAEmulator:
             print(f"DEBUG: ignoring port {port:X}")
         
     def handle_vram_write(self, address, size, value):
+        """
+        Hook for VRAM writes. If in a planar graphics mode, divert to the planar logic.
+        Otherwise, return False to let the default memory write happen.
+        """
+        # This logic should only apply to planar graphics modes like 0x10 or 0x12.
         if self.is_text_mode or self.current_mode not in (0x10, 0x12):
-            return False      # ignore text/other modes
-    
+            return False  # Let Unicorn handle the write for text/linear modes.
+
+        # Handle multi-byte writes by processing each byte individually.
         for i in range(size):
-            b = (value >> (i*8)) & 0xFF
-            self._write_mode2_byte(address+i, b)
-        return True
+            byte_to_write = (value >> (i * 8)) & 0xFF
+            self._write_planar_byte(address + i, byte_to_write)
+        
+        return True # We have handled the memory write.
 
-    def _write_mode2_byte(self, address, value):
+    def _write_planar_byte(self, address, value):
         """
-        Handles a memory write to VRAM, applying VGA hardware logic.
-        This version corrects the handling of the Bit Mask in Write Mode 2.
+        Handles a memory write to VRAM in a planar graphics mode, applying VGA hardware logic.
+        This correctly simulates latching, write modes, bit masks, and map masks.
         """
-
+        # --- 1. Get current VGA register states ---
         map_mask = self.sequencer_registers[2]
         write_mode = self.gc_registers[5] & 0x03
         logical_op = (self.gc_registers[3] >> 3) & 0x03
-        
-        final_bit_mask = self.gc_registers[8]
-        
-        vram_offset = address #- self.vram_base
-        plane_size = 32768
+        bit_mask = self.gc_registers[8]
+        set_reset_val = self.gc_registers[0]
+        enable_set_reset = self.gc_registers[1]
 
-        #if not (self.vram_base <= vram_offset < self.vram_base + plane_size * 1):
-        #    print("error offset")
-        #    return False
+        # --- 2. Latch Phase ---
+        # Calculate the offset within the 64KB VRAM window (0x0000 to 0xFFFF)
+        offset_in_window = address - self.vram_base
+        plane_size = 32768 # The size of one plane in our memory model
+
+        # The CPU address is always within the A0000-AFFFF range for these modes.
+        # We only need to handle offsets within a single plane's address space.
+        if not (0 <= offset_in_window < plane_size):
+            # In a real VGA, this might wrap or be handled by odd/even mode.
+            # For this emulator, we'll ignore writes outside the first 32KB per plane.
+            return
 
         try:
-            latched = [
-                self.uc.mem_read(vram_offset, 1)[0],
-                self.uc.mem_read(vram_offset + plane_size, 1)[0],
-                self.uc.mem_read(vram_offset + 2 * plane_size, 1)[0],
-                self.uc.mem_read(vram_offset + 3 * plane_size, 1)[0]
+            # Latch (read) the byte from all 4 planes at the target offset.
+            latched_bytes = [
+                self.uc.mem_read(self.vram_base + offset_in_window, 1)[0],
+                self.uc.mem_read(self.vram_base + offset_in_window + plane_size, 1)[0],
+                self.uc.mem_read(self.vram_base + offset_in_window + 2 * plane_size, 1)[0],
+                self.uc.mem_read(self.vram_base + offset_in_window + 3 * plane_size, 1)[0]
             ]
-            
-            data_to_write = [0, 0, 0, 0]
+        except UcError as e:
+            print(f"ERROR latching VRAM at addr {hex(address)}: {e}")
+            return
 
-            if write_mode == 0:
-                enable_set_reset = self.gc_registers[1]
-                set_reset_color = self.gc_registers[0]
-                for i in range(4):
-                    if (enable_set_reset >> i) & 1:
-                        data_to_write[i] = 0xFF if (set_reset_color >> i) & 1 else 0x00
-                    else:
-                        data_to_write[i] = value
+        # --- 3. Data Processing Phase ---
+        # Figure out what data to write to each plane based on the write mode.
+        processed_data = [0] * 4
 
-            elif write_mode == 2:
-                set_reset_color = self.gc_registers[0]
-                for i in range(4):
-                    data_to_write[i] = 0xFF if (set_reset_color >> i) & 1 else 0x00
-                
-                final_bit_mask &= value
-
-            else:
-                return False
-
-            final_planes = [0, 0, 0, 0]
+        if write_mode == 0:
+            # For each plane, decide if we use CPU data or expanded Set/Reset data.
             for i in range(4):
-                plane_data = data_to_write[i]
-                if logical_op == 1: plane_data &= latched[i]
-                elif logical_op == 2: plane_data |= latched[i]
-                elif logical_op == 3: plane_data ^= latched[i]
+                if (enable_set_reset >> i) & 1:
+                    # Use Set/Reset: expand the i-th bit of the color to a full byte.
+                    processed_data[i] = 0xFF if (set_reset_val >> i) & 1 else 0x00
+                else:
+                    # Use CPU data directly.
+                    processed_data[i] = value
 
-                # Use the calculated final_bit_mask for this single operation
-                final_planes[i] = (latched[i] & ~final_bit_mask) | (plane_data & final_bit_mask)
+        elif write_mode == 1:
+            # Write the latched data back (used for VRAM-to-VRAM copies).
+            processed_data = latched_bytes
 
-            if map_mask & 0x01: self.uc.mem_write(vram_offset + 0 * plane_size, bytes([final_planes[0]])) 
-            if map_mask & 0x02: self.uc.mem_write(vram_offset + 1 * plane_size, bytes([final_planes[1]]))
-            if map_mask & 0x04: self.uc.mem_write(vram_offset + 2 * plane_size, bytes([final_planes[2]]))
-            if map_mask & 0x08: self.uc.mem_write(vram_offset + 3 * plane_size, bytes([final_planes[3]]))
+        elif write_mode == 2:
+            # CPU data's low 4 bits are a color. Expand this color to 4 plane bytes.
+            cpu_color = value & 0x0F
+            for i in range(4):
+                processed_data[i] = 0xFF if (cpu_color >> i) & 1 else 0x00
 
-        except (UcError, IndexError) as e:
-            print(f"ERROR in planar VRAM write logic at {hex(address)}: {e}")
-            
-        return True
+        elif write_mode == 3:
+            # Rotate CPU data, then mask it with the Bit Mask register.
+            rotate_count = self.gc_registers[3] & 0x07
+            rotated_val = ((value >> rotate_count) | (value << (8 - rotate_count))) & 0xFF
+            masked_val = rotated_val & bit_mask
+            # This result is applied to all planes.
+            for i in range(4):
+                processed_data[i] = masked_val
+
+        # --- 4. Write Phase ---
+        # Combine processed data with latched data and write back to the enabled planes.
+        for i in range(4):
+            # Check if this plane is enabled for writing by the Map Mask
+            if (map_mask >> i) & 1:
+                # Apply the specified logical operation
+                write_val = processed_data[i]
+                if logical_op == 1:   # AND
+                    write_val &= latched_bytes[i]
+                elif logical_op == 2: # OR
+                    write_val |= latched_bytes[i]
+                elif logical_op == 3: # XOR
+                    write_val ^= latched_bytes[i]
+                # Default (op=0) is a direct move.
+
+                # Apply the Bit Mask: New bits come from write_val, old bits from latched_bytes.
+                final_byte = (latched_bytes[i] & ~bit_mask) | (write_val & bit_mask)
+
+                # Finally, write the resulting byte to the plane's memory.
+                try:
+                    plane_addr = self.vram_base + offset_in_window + (i * plane_size)
+                    self.uc.mem_write(plane_addr, bytes([final_byte]))
+                except UcError as e:
+                    print(f"ERROR writing to plane {i} at {hex(plane_addr)}: {e}")
 
 
 
