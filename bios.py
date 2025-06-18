@@ -5,6 +5,7 @@ import collections # For deque, a double-ended queue for keyboard buffer
 from unicorn import *
 from unicorn.x86_const import *
 import pygame
+import random
 
 # --- BIOS/DOS Data Areas (common for emulators) ---
 BIOS_DATA_AREA = 0x400 # Segment 0x40, physical 0x400
@@ -565,19 +566,43 @@ class VGAEmulator:
             # Read the entire graphics VRAM segment (usually 64KB at 0xA0000)
             # For 640x350x16, each plane is 28,000 bytes. All 4 fit in 112KB,
             # so bank switching is needed. We'll assume the relevant part is mapped.
-            read_size = 65536 # Read the full 64KB segment
-            if self.vram_base + read_size > self.vram_base + VGA_MEM_SIZE:
-                read_size = self.vram_base + VGA_MEM_SIZE - self.vram_base
-                if read_size < 0: read_size = 0
-            
-            try:
-                vram_data = self.uc.mem_read(self.vram_base, read_size)
-            except UcError as e:
-                print(f"    Error reading VRAM for rendering: {e}. Skipping render.")
-                return
+        read_size = VGA_MEM_SIZE
+        try:
+            vram_data = self.uc.mem_read(self.vram_base, read_size)
+        except Exception as e:
+            print(f"Error reading VRAM: {e}")
+            return
 
-            # --- Handle Mode 0x13 (Linear Packed-Pixel) ---
-            if self.current_mode == 0x13:
+        if self.current_mode == 0x10:
+            plane_size = 32768 # 32KB per plane in our model
+            width_in_bytes = self.display_width // 8
+
+            for y in range(self.display_height):
+                for x in range(self.display_width):
+                    offset = (y * width_in_bytes) + (x // 8)
+                    bit_pos = 7 - (x % 8)
+                    
+                    # Check bounds to prevent reading past our allocated memory
+                    if (offset + 3 * plane_size) >= len(vram_data):
+                       continue
+
+                    # Read the byte from each of the four planes
+                    byte_p0 = vram_data[offset]
+                    byte_p1 = vram_data[offset + plane_size]
+                    byte_p2 = vram_data[offset + 2 * plane_size]
+                    byte_p3 = vram_data[offset + 3 * plane_size]
+
+                    # Extract the single bit for our pixel from each plane's byte
+                    bit0 = (byte_p0 >> bit_pos) & 1
+                    bit1 = (byte_p1 >> bit_pos) & 1
+                    bit2 = (byte_p2 >> bit_pos) & 1
+                    bit3 = (byte_p3 >> bit_pos) & 1
+
+                    color_index = (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0
+                    color_rgb = self.palette_16_color[color_index]
+                    self.screen.set_at((x, y), color_rgb)
+             # --- Handle Mode 0x13 (Linear Packed-Pixel) ---
+        if self.current_mode == 0x13:
                 for y in range(self.display_height):
                     for x in range(self.display_width):
                         offset = y * self.display_width + x
@@ -586,47 +611,6 @@ class VGAEmulator:
                         color_rgb = VGA_PALETTE_256_COLORS[color_index]
                         self.screen.set_at((x, y), color_rgb)
 
-            elif self.current_mode == 0x10:
-                # In a simple emulation model, the 4 planes are laid out one after another.
-                # A real VGA uses bank switching controlled by registers.
-                # For 640x350, each plane needs 640*350/8 = 28000 bytes.
-                # Let's assume a layout where each plane occupies a 32KB block for simplicity.
-                plane_size = 32768 # A common bank size
-                width_in_bytes = self.display_width // 8 # 640 / 8 = 80 bytes per scanline
-
-                for y in range(self.display_height):
-                    for x in range(self.display_width):
-                        # Calculate the offset within a single plane
-                        offset = (y * width_in_bytes) + (x // 8)
-                        
-                        # The bit within the byte for this pixel (7=leftmost, 0=rightmost)
-                        bit_pos = 7 - (x % 8)
-                        
-                        # Ensure we don't read past the end of our VRAM buffer
-                        if offset >= len(vram_data) or \
-                           (offset + 3 * plane_size) >= len(vram_data):
-                           continue
-
-                        # Read the byte from each of the four planes
-                        # This is a simplified model. A real VGA uses the Read Map Select register.
-                        # Our VRAM write hook must have placed data correctly for this to work.
-                        byte_p0 = vram_data[offset]
-                        byte_p1 = vram_data[offset + plane_size]
-                        byte_p2 = vram_data[offset + 2 * plane_size]
-                        byte_p3 = vram_data[offset + 3 * plane_size]
-
-                        # Extract the single bit for our pixel from each plane's byte
-                        bit0 = (byte_p0 >> bit_pos) & 1 # Blue
-                        bit1 = (byte_p1 >> bit_pos) & 1 # Green
-                        bit2 = (byte_p2 >> bit_pos) & 1 # Red
-                        bit3 = (byte_p3 >> bit_pos) & 1 # Intensity
-
-                        # Combine the 4 bits to form the 4-bit color index
-                        color_index = (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0
-
-                        # Get the final RGB color from our 16-color palette
-                        color_rgb = self.palette_16_color[color_index]
-                        self.screen.set_at((x, y), color_rgb)
 
     def process_input(self):
         """Processes Pygame events for keyboard input and window management."""
@@ -917,37 +901,37 @@ class VGAEmulator:
 
             # --- LOGIC STEP: Apply logic based on Write Mode ---
             if write_mode == 2:
-                # The CPU data ('value') is a bitmask for which pixels to change.
-                # The color comes from the Set/Reset register.
-                
-                # The final mask is the combination of the CPU data and the Bit Mask register.
                 final_pixel_mask = value & bit_mask
                 
-                # Decompose the Set/Reset color into its 4 plane bits.
                 color_bit_p0 = (set_reset_color >> 0) & 1
                 color_bit_p1 = (set_reset_color >> 1) & 1
                 color_bit_p2 = (set_reset_color >> 2) & 1
                 color_bit_p3 = (set_reset_color >> 3) & 1
                 
-                # For each plane, we only apply the Set/Reset color if that plane
-                # is enabled in the Enable Set/Reset register. Otherwise, the plane
-                # is unchanged (it keeps its latched value).
+                # Start with the latched values
+                new_p0, new_p1, new_p2, new_p3 = latched_p0, latched_p1, latched_p2, latched_p3
 
+                # Only modify the planes that are enabled
                 if (enable_set_reset >> 0) & 1:
-                    final_p0 = (latched_p0 & ~final_pixel_mask) | (color_bit_p0 * final_pixel_mask)
-                # else final_p0 remains latched_p0
+                    new_p0 = (latched_p0 & ~final_pixel_mask) | (color_bit_p0 * final_pixel_mask)
                 
                 if (enable_set_reset >> 1) & 1:
-                    final_p1 = (latched_p1 & ~final_pixel_mask) | (color_bit_p1 * final_pixel_mask)
-                # else final_p1 remains latched_p1
+                    new_p1 = (latched_p1 & ~final_pixel_mask) | (color_bit_p1 * final_pixel_mask)
                 
                 if (enable_set_reset >> 2) & 1:
-                    final_p2 = (latched_p2 & ~final_pixel_mask) | (color_bit_p2 * final_pixel_mask)
-                # else final_p2 remains latched_p2
+                    new_p2 = (latched_p2 & ~final_pixel_mask) | (color_bit_p2 * final_pixel_mask)
                 
                 if (enable_set_reset >> 3) & 1:
-                    final_p3 = (latched_p3 & ~final_pixel_mask) | (color_bit_p3 * final_pixel_mask)
-                # else final_p3 remains latched_p3
+                    new_p3 = (latched_p3 & ~final_pixel_mask) | (color_bit_p3 * final_pixel_mask)
+
+                # Assign the final results
+                final_p0, final_p1, final_p2, final_p3 = new_p0, new_p1, new_p2, new_p3
+                #set_reset_color = int(random.random() * 15)
+                #final_p0 = (set_reset_color >> 0) & 1  # -> (9 >> 0) & 1 = 1
+                #final_p1 = (set_reset_color >> 1) & 1  # -> (9 >> 1) & 1 = 0
+                #final_p2 = (set_reset_color >> 2) & 1  # -> (9 >> 2) & 1 = 0
+                #final_p3 = (set_reset_color >> 3) & 1  # -> (9 >> 3) & 1 = 1
+        
 
             elif write_mode == 0:
                 # This is the more complex mode. We can keep our previous bit-by-bit
@@ -983,7 +967,7 @@ class VGAEmulator:
             if map_mask & 0x08:
                 uc.mem_write(self.vram_base + vram_offset + (3 * plane_size), bytes([final_p3]))
 
-            print(f"wrote with mask {map_mask:X} {value:X} ", final_p0, final_p1, final_p2, final_p3)
+            print(f"wrote with mask off: {vram_offset:X} mask: {map_mask:X} val: {value:X} ", final_p0, final_p1, final_p2, final_p3)
 
         except UcError as e:
             print(f"ERROR in planar VRAM write logic at {hex(address)}: {e}")
@@ -1310,9 +1294,11 @@ def handle_int10(uc, vga_emulator):
             
             try:
                 palette_bytes = uc.mem_read(palette_data_addr, 16)
+                print("palette bytes:", palette_bytes)
                 for i in range(16):
                     new_color_rgb = vga_emulator._decode_ega_palette_color(palette_bytes[i])
                     vga_emulator.palette_16_color[i] = new_color_rgb
+                print(vga_emulator.palette_16_color)
                 print(f"      Palette updated successfully.")
             except UcError as e:
                 print(f"      ERROR reading palette data: {e}")
