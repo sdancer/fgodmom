@@ -525,8 +525,8 @@ def hook_out(uc, port, size, value, user_data):
     ip = uc.reg_read(UC_X86_REG_IP)
     
     # Only print for non-VGA ports for cleaner logs, or keep for debugging.
-    if not (0x3C0 <= port <= 0x3CF) and not (0x3D4 <= port <= 0x3D5):
-        print(f"[OUT] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}  value=0x{value:X}")
+    #if not (0x3C0 <= port <= 0x3CF) and not (0x3D4 <= port <= 0x3D5):
+    print(f"[OUT] {cs:04X}:{ip:04X}  port=0x{port:04X}  size={size}  value=0x{value:X}")
 
     # --- MODIFIED: Delegate to VGA Emulator ---
     vga_emulator = user_data['vga_emulator']
@@ -572,6 +572,26 @@ def setup_ivt_and_handlers(uc):
         uc.mem_write(ivt_entry_address, ivt_entry)
 
     print(f"[*] IVT populated. All 256 interrupts now point to handlers at {handler_segment:04X}:[0000-00FF].")
+
+def hook_main_func(uc, address, size, user_data):
+    """
+    This function is called for each instruction executed
+    within the range [HOOK_START_LINEAR, HOOK_END_LINEAR].
+    """
+    try:
+        # Read the required segment registers
+        cs = uc.reg_read(UC_X86_REG_CS)
+        ds = uc.reg_read(UC_X86_REG_DS)
+
+        # Calculate the current offset from the linear address
+        # offset = linear_address - (segment * 16)
+        offset = address - (cs * 16)
+
+        # Print the report as requested
+        print(f">>> MFHOOK: Executing at {cs:04x}:{offset:04x}, Current DS = {ds:04x}")
+
+    except UcError as e:
+        print(f"ERROR in hook: {e}")
 
 def extract_lz91_exe(filename):
     global UNPACKED_EXE_DUMPED
@@ -710,6 +730,22 @@ def extract_lz91_exe(filename):
                 end=HANDLER_CODE_BASE + 255, # Hook the entire block of 256 IRETs
                 user_data={'vga_emulator': vga_emulator})
 
+    # such complexity, is it a university student?
+    # The 16-bit segment for our code
+    CODE_SEGMENT = 0x1000
+    
+    # Calculate the linear base address for our code segment
+    # Linear Address = (Segment * 16)
+    CODE_BASE_LINEAR = CODE_SEGMENT * 16  # 0x10000
+    
+    # Define the hook range from the user's request
+    HOOK_START_OFFSET = 0x0378
+    HOOK_END_OFFSET   = 0x09a2
+    
+    # Convert the hook range to linear addresses
+    HOOK_START_LINEAR = CODE_BASE_LINEAR + HOOK_START_OFFSET  # 0x10378
+    HOOK_END_LINEAR   = CODE_BASE_LINEAR + HOOK_END_OFFSET    # 0x109a2
+    mu.hook_add(UC_HOOK_CODE, hook_main_func, begin=HOOK_START_LINEAR, end=HOOK_END_LINEAR)
 
     # Emulation loop
     running = True
@@ -793,7 +829,7 @@ def extract_lz91_exe(filename):
                     # Still waiting for a key, don't resume Unicorn.
                     # Just keep rendering the screen.
                     vga_emulator.render_frame()
-                    pygame.time.Clock().tick(30) # Limit frame rate when waiting
+                    pygame.time.Clock().tick(100) # Limit frame rate when waiting
                     continue # Skip Unicorn emulation in this iteration
             
         current_time = time.time()

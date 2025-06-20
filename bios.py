@@ -305,7 +305,7 @@ class VGAEmulator:
            self.screen.get_width() != self.display_width or \
            self.screen.get_height() != self.display_height:
             self.screen = pygame.display.set_mode((self.display_width * 2, self.display_height * 2))
-            self.logical_screen = pygame.Surface((self.display_width, self.display_height))
+            self.logical_screen = pygame.Surface((self.display_width * 2, self.display_height * 2))
             pygame.display.set_caption(f"Unicorn DOS Emulator (Mode {hex(self.current_mode)})")
 
         # Clear screen on mode change
@@ -625,7 +625,21 @@ class VGAEmulator:
 
                     color_index = (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0
                     color_rgb = self.palette_16_color[color_index]
-                    self.logical_screen.set_at((x, y), color_rgb)
+                    color_rgb_w = (255,255,255)
+                    color_rgb_b = (0,0,0)
+
+                    c0 = color_rgb_w if bit0 else color_rgb_b
+                    c1 = color_rgb_w if bit1 else color_rgb_b
+                    c2 = color_rgb_w if bit2 else color_rgb_b
+                    c3 = color_rgb_w if bit3 else color_rgb_b
+                    self.logical_screen.set_at((x, y), c0)
+
+                    self.logical_screen.set_at((x + self.display_width, y), c1)
+                    self.logical_screen.set_at((x, y + self.display_height), c2)
+                    self.logical_screen.set_at((x + self.display_width, y + self.display_height), c3)
+
+
+
 
              # --- Handle Mode 0x13 (Linear Packed-Pixel) ---
         if self.current_mode == 0x13:
@@ -814,7 +828,7 @@ class VGAEmulator:
         # Sequencer Ports (often used for memory mapping and timing)
         elif port == 0x3C4:
             self.sequencer_index = value & 0x07 # Index is usually 3 bits
-            print(f"DEBUG: VGA Sequencer Index set to {self.sequencer_index}")
+            print(f"DEBUG: VGA Sequencer Index set to {self.sequencer_index} orig value: {value}")
         elif port == 0x3C5:
             if self.sequencer_index < len(self.sequencer_registers):
                 print(f"DEBUG: VGA Sequencer Register {self.sequencer_index} set to 0x{value:02X}")
@@ -835,7 +849,7 @@ class VGAEmulator:
             return False  # Let Unicorn handle the write for text/linear modes.
 
         # Handle multi-byte writes by processing each byte individually.
-        # print(f"{address:X} {size:X}")
+        print(f"{address:X} {size:X} {value:X}")
         for i in range(size):
             byte_to_write = (value >> (i * 8)) & 0xFF
             self._write_planar_byte(address + i, value = byte_to_write)
@@ -884,6 +898,7 @@ class VGAEmulator:
         # === WRITE MODE 0 LOGIC ===
         # ==========================
         if write_mode == 0:
+            print("write_mode =  0")
             # Data is a mix of CPU data and expanded Set/Reset data.
             # The bit_mask is applied at the end.
             for p in range(4):
@@ -900,6 +915,7 @@ class VGAEmulator:
         # === WRITE MODE 1 LOGIC ===
         # ==========================
         elif write_mode == 1:
+            print("write_mode =  1")
             # Simple VRAM-to-VRAM copy. Writes the latched data back.
             # No other registers are involved. The final map_mask still applies.
             processed_data = latched_bytes
@@ -908,33 +924,37 @@ class VGAEmulator:
         # === WRITE MODE 2 LOGIC ===
         # ==========================
         elif write_mode == 2:
-            # The most complex mode. CPU data acts as a bit-selector.
-            cpu_data = value
+            # 1.  Expand the single-bit Set/Reset latch for each plane.
+            #     GC register 0 contains four bits: b0-b3 = planes 0-3.
             sr_expanded = [(0xFF if (set_reset_val >> p) & 1 else 0x00) for p in range(4)]
-    
+
+            cpu_mask = value        # each bit is a pixel selector           (D0..D7)
+            bit_mask = self.gc_registers[8]  # GC register 8 – additional AND mask
+
             for p in range(4):
-                # Step A: Select between Set/Reset and Latched data using CPU data as a mask.
-                # If a bit in cpu_data is 1, use the Set/Reset byte.
-                # If a bit in cpu_data is 0, use the Latched byte.
-                selected_data = (sr_expanded[p] & cpu_data) | (latched_bytes[p] & ~cpu_data)
-    
-                # Step B: Apply logical operation against the latched data.
-                if logical_op == 1:   # AND
-                    result = selected_data & latched_bytes[p]
-                elif logical_op == 2: # OR
-                    result = selected_data | latched_bytes[p]
-                elif logical_op == 3: # XOR
-                    result = selected_data ^ latched_bytes[p]
-                else: # 0 = REPLACE
-                    result = selected_data
-    
-                # Step C: Apply the Bit Mask. Only bits set in the mask are updated.
-                processed_data[p] = (latched_bytes[p] & ~bit_mask) | (result & bit_mask)
+                # Step A – choose per pixel:  selector bit 1 → Set/Reset, 0 → latched
+                selected = (cpu_mask & sr_expanded[p]) | (~cpu_mask & latched_bytes[p])
+
+                # Step B – apply the logical function selected in GC reg 3 bits 5-3
+                if   logical_op == 1:              # AND
+                    alu_out = selected & latched_bytes[p]
+                elif logical_op == 2:              # OR
+                    alu_out = selected | latched_bytes[p]
+                elif logical_op == 3:              # XOR
+                    alu_out = selected ^ latched_bytes[p]
+                else:                              # 0 = REPLACE
+                    alu_out = selected
+
+                # Step C – apply the Bit-Mask (GC reg 8) **after** the ALU
+                result = (latched_bytes[p] & ~bit_mask) | (alu_out & bit_mask)
+
+                processed_data[p] = result
     
         # ==========================
         # === WRITE MODE 3 LOGIC ===
         # ==========================
         elif write_mode == 3:
+            print("write_mode = 3")
             # A mix of Mode 0 and Mode 2. The bit mask is rotated by the CPU data.
             rotated_mask = bit_mask
             # For simplicity, we are not implementing the bit mask rotation here.
@@ -949,6 +969,9 @@ class VGAEmulator:
             if (map_mask >> p) & 1:
                 shadow_offset = offset_in_window + p * plane_size
                 self.vram_shadow[shadow_offset] = processed_data[p]
+
+
+
 
 
 # Define some placeholder addresses and values for demonstration.
