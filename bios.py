@@ -58,6 +58,7 @@ VGA_PALETTE_16_COLORS = [
 
 # In a real game, this palette would be loaded.
 VGA_PALETTE_256_COLORS = [(i, i, i) for i in range(256)]
+DEBUG_DRAW = False
 
 
 class VGAEmulator:
@@ -305,7 +306,11 @@ class VGAEmulator:
            self.screen.get_width() != self.display_width or \
            self.screen.get_height() != self.display_height:
             self.screen = pygame.display.set_mode((self.display_width * 2, self.display_height * 2))
-            self.logical_screen = pygame.Surface((self.display_width * 2, self.display_height * 2))
+            if DEBUG_DRAW:
+                self.logical_screen = pygame.Surface((self.display_width * 2, self.display_height * 2))
+            else:
+                self.logical_screen = pygame.Surface((self.display_width, self.display_height))
+
             pygame.display.set_caption(f"Unicorn DOS Emulator (Mode {hex(self.current_mode)})")
 
         # Clear screen on mode change
@@ -625,18 +630,22 @@ class VGAEmulator:
 
                     color_index = (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0
                     color_rgb = self.palette_16_color[color_index]
-                    color_rgb_w = (255,255,255)
-                    color_rgb_b = (0,0,0)
 
-                    c0 = color_rgb_w if bit0 else color_rgb_b
-                    c1 = color_rgb_w if bit1 else color_rgb_b
-                    c2 = color_rgb_w if bit2 else color_rgb_b
-                    c3 = color_rgb_w if bit3 else color_rgb_b
-                    self.logical_screen.set_at((x, y), c0)
+                    if DEBUG_DRAW:
+                        color_rgb_w = (255,255,255)
+                        color_rgb_b = (0,0,0)
+    
+                        c0 = color_rgb_w if bit0 else color_rgb_b
+                        c1 = color_rgb_w if bit1 else color_rgb_b
+                        c2 = color_rgb_w if bit2 else color_rgb_b
+                        c3 = color_rgb_w if bit3 else color_rgb_b
+                        self.logical_screen.set_at((x, y), c0)
+                        self.logical_screen.set_at((x + self.display_width, y), c1)
+                        self.logical_screen.set_at((x, y + self.display_height), c2)
+                        self.logical_screen.set_at((x + self.display_width, y + self.display_height), c3)
+                    else:
+                        self.logical_screen.set_at((x, y), color_rgb)
 
-                    self.logical_screen.set_at((x + self.display_width, y), c1)
-                    self.logical_screen.set_at((x, y + self.display_height), c2)
-                    self.logical_screen.set_at((x + self.display_width, y + self.display_height), c3)
 
 
 
@@ -812,14 +821,18 @@ class VGAEmulator:
             self.sequencer_registers[4] = 0x06 # Memory Mode: Extended memory, odd/even disabled
             print("    VGA registers reset to default graphics state (Map Mask = 0x0F).")
 
-    def handle_port_write(self, port, value):
+    def handle_port_write(self, port, value, size):
         """
         Handles writes to VGA I/O ports to update the internal register state.
         """
         # Graphics Controller Ports
         if port == 0x3CE:
             self.gc_index = value & 0x0F # Index is usually 4 bits
-             #print(f"DEBUG: VGA GC Index set to {self.gc_index}")
+            #print(f"DEBUG: VGA GC Index set to {self.gc_index}")
+            if size == 2:
+                sv = value >> 8
+                self.gc_registers[self.gc_index] = sv 
+                print(f"DEBUG: VGA GC Register {self.gc_index} set to 0x{sv:02X}")
         elif port == 0x3CF:
             if self.gc_index < len(self.gc_registers):
                 print(f"DEBUG: VGA GC Register {self.gc_index} set to 0x{value:02X}")
@@ -829,6 +842,10 @@ class VGAEmulator:
         elif port == 0x3C4:
             self.sequencer_index = value & 0x07 # Index is usually 3 bits
             print(f"DEBUG: VGA Sequencer Index set to {self.sequencer_index} orig value: {value}")
+            if size == 2:
+                sv = value >> 8
+                self.sequencer_registers[self.sequencer_index] = sv 
+                print(f"DEBUG: VGA Sequencer Register {self.sequencer_index} set to 0x{sv:02X}")
         elif port == 0x3C5:
             if self.sequencer_index < len(self.sequencer_registers):
                 print(f"DEBUG: VGA Sequencer Register {self.sequencer_index} set to 0x{value:02X}")

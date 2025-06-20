@@ -530,7 +530,7 @@ def hook_out(uc, port, size, value, user_data):
 
     # --- MODIFIED: Delegate to VGA Emulator ---
     vga_emulator = user_data['vga_emulator']
-    vga_emulator.handle_port_write(port, value)
+    vga_emulator.handle_port_write(port, value, size)
 
 IVT_BASE = 0x00000
 HANDLER_CODE_BASE = 0xF0000 # Use a high memory area for our virtual IRET handlers
