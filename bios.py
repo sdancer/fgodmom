@@ -841,7 +841,7 @@ class VGAEmulator:
         # Sequencer Ports (often used for memory mapping and timing)
         elif port == 0x3C4:
             self.sequencer_index = value & 0x07 # Index is usually 3 bits
-            print(f"DEBUG: VGA Sequencer Index set to {self.sequencer_index} orig value: {value}")
+            print(f"DEBUG: VGA Sequencer Index set to {self.sequencer_index} orig value: {value:X}")
             if size == 2:
                 sv = value >> 8
                 self.sequencer_registers[self.sequencer_index] = sv 
@@ -941,30 +941,18 @@ class VGAEmulator:
         # === WRITE MODE 2 LOGIC ===
         # ==========================
         elif write_mode == 2:
-            # 1.  Expand the single-bit Set/Reset latch for each plane.
-            #     GC register 0 contains four bits: b0-b3 = planes 0-3.
-            sr_expanded = [(0xFF if (set_reset_val >> p) & 1 else 0x00) for p in range(4)]
-
-            cpu_mask = value        # each bit is a pixel selector           (D0..D7)
-            bit_mask = self.gc_registers[8]  # GC register 8 – additional AND mask
-
             for p in range(4):
-                # Step A – choose per pixel:  selector bit 1 → Set/Reset, 0 → latched
-                selected = (cpu_mask & sr_expanded[p]) | (~cpu_mask & latched_bytes[p])
-
-                # Step B – apply the logical function selected in GC reg 3 bits 5-3
-                if   logical_op == 1:              # AND
-                    alu_out = selected & latched_bytes[p]
-                elif logical_op == 2:              # OR
-                    alu_out = selected | latched_bytes[p]
-                elif logical_op == 3:              # XOR
-                    alu_out = selected ^ latched_bytes[p]
-                else:                              # 0 = REPLACE
-                    alu_out = selected
-
-                # Step C – apply the Bit-Mask (GC reg 8) **after** the ALU
-                result = (latched_bytes[p] & ~bit_mask) | (alu_out & bit_mask)
-
+                src_colour = 0xFF if ((value >> p) & 1) else 0x00
+        
+                # ALU
+                if   logical_op == 1: alu = src_colour & latched_bytes[p]
+                elif logical_op == 2: alu = src_colour | latched_bytes[p]
+                elif logical_op == 3: alu = src_colour ^ latched_bytes[p]
+                else:                 alu = src_colour              # replace
+        
+                write_mask = bit_mask
+                result     = (latched_bytes[p] & ~write_mask) | (alu & write_mask)
+        
                 processed_data[p] = result
     
         # ==========================
